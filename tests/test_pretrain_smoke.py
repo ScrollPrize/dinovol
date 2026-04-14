@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import zarr
 
-from dinovol_2.loss import GramLoss
+from dinovol_2.loss import GramLoss, NEPALoss
 from dinovol_2.pretrain import DinoIBOTPretrainer
 from dinovol_2.verify import build_verification_report
 
@@ -250,6 +250,99 @@ class PretrainSmokeTests(unittest.TestCase):
         finally:
             trainer._close_auxiliary_datasets()
             trainer._finish_wandb()
+
+    @classmethod
+    def _nepa_config(cls, *, output_name: str = "nepa") -> dict:
+        config = cls._base_config(output_name=output_name)
+        config["dino_loss_weight"] = 0.0
+        config["ibot_loss_weight"] = 0.0
+        config["koleo_loss_weight"] = 0.0
+        config["nepa"] = {
+            "enabled": True,
+            "loss_weight": 1.0,
+            "shift": True,
+        }
+        return config
+
+    def test_nepa_smoke_step(self) -> None:
+        report = build_verification_report(self._nepa_config(output_name="nepa_smoke"), use_amp=False)
+        self.assertTrue(report["forward"]["checks"]["all_passed"])
+        self.assertTrue(report["train_step"]["checks"]["all_passed"])
+        self.assertIn("nepa", report["forward"]["losses"])
+        self.assertGreater(report["forward"]["losses"]["nepa"], 0.0)
+
+    def test_nepa_train_step_is_finite(self) -> None:
+        trainer = DinoIBOTPretrainer(self._nepa_config(output_name="nepa_train_step"))
+        dataloader = trainer.build_dataloader()
+        try:
+            metrics = trainer.train_step(next(iter(dataloader)), step=0)
+            self.assertTrue(np.isfinite(metrics["loss"]))
+            self.assertTrue(np.isfinite(metrics["nepa_loss"]))
+            self.assertGreater(metrics["nepa_loss"], 0.0)
+        finally:
+            trainer._close_dataloader(dataloader)
+            trainer._close_auxiliary_datasets()
+            trainer._finish_wandb()
+
+    def test_nepa_loss_shift_semantics(self) -> None:
+        torch.manual_seed(0)
+        input_emb = torch.randn(2, 5, 8, requires_grad=False)
+        output_emb = torch.randn(2, 5, 8, requires_grad=True)
+
+        loss_fn = NEPALoss(shift=True)
+        loss = loss_fn(input_emb, output_emb)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertTrue(torch.isfinite(output_emb.grad).all())
+        # The last position's gradient is zero because it has no target in shift mode.
+        self.assertTrue(torch.all(output_emb.grad[:, -1, :] == 0))
+
+        # Under perfect prediction the loss is -1 (cosine similarity = 1).
+        perfect = torch.randn(2, 5, 8)
+        shifted = torch.zeros_like(perfect)
+        shifted[:, :-1, :] = perfect[:, 1:, :]
+        loss_perfect = NEPALoss(shift=True)(perfect, shifted)
+        self.assertAlmostEqual(float(loss_perfect), -1.0, places=5)
+
+    def test_nepa_causal_attention_does_not_leak(self) -> None:
+        # Build a minimal backbone and verify that patch token outputs depend
+        # only on earlier patches under is_causal=True.
+        import torch
+
+        from dinovol_2.model.dinov2_eva import Eva
+
+        torch.manual_seed(0)
+        # head_dim must be divisible by 2*ndim=6 for 3D RoPE: embed_dim=36, num_heads=3 -> head_dim=12.
+        model = Eva(
+            input_channels=1,
+            global_crops_size=(16, 16, 16),
+            local_crops_size=(8, 8, 8),
+            embed_dim=36,
+            patch_size=(8, 8, 8),
+            depth=2,
+            num_heads=3,
+            qkv_fused=False,
+            class_token=True,
+            num_reg_tokens=0,
+            grad_checkpointing=False,
+        ).eval()
+
+        x = torch.randn(1, 1, 16, 16, 16)
+
+        with torch.no_grad():
+            out_a = model.forward_features(x, is_causal=True)["x_norm_patchtokens"]
+
+        # Perturb the LAST patch voxels; any causal-respecting earlier token
+        # must remain unchanged.
+        x_perturbed = x.clone()
+        x_perturbed[:, :, 8:, 8:, 8:] += torch.randn_like(x_perturbed[:, :, 8:, 8:, 8:])
+
+        with torch.no_grad():
+            out_b = model.forward_features(x_perturbed, is_causal=True)["x_norm_patchtokens"]
+
+        # The output at position 0 must be identical (causality: pos 0 sees only
+        # itself + prefix, never later tokens).
+        self.assertTrue(torch.allclose(out_a[:, 0, :], out_b[:, 0, :], atol=1e-5))
 
     def test_gram_loss_non_img_level_is_per_sample(self) -> None:
         loss_fn = GramLoss(apply_norm=False)

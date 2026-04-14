@@ -634,6 +634,9 @@ class DinoVitStudentTeacher(nn.Module):
             outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
             outputs["patch_projections"] = self.project_patch_tokens(branch, backbone_outputs["x_norm_patchtokens"])
+        # Pass through input embeddings for NEPA loss when available
+        if backbone_outputs.get("x_input_patchtokens") is not None:
+            outputs["input_patch_embeddings"] = backbone_outputs["x_input_patchtokens"]
         return outputs
 
     def _forward_branch(
@@ -645,8 +648,9 @@ class DinoVitStudentTeacher(nn.Module):
         project_patch_tokens: bool = False,
         *,
         view_kind: str = "global",
+        is_causal: bool = False,
     ) -> Mapping[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
-        backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training, view_kind=view_kind)
+        backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training, view_kind=view_kind, is_causal=is_causal)
         if isinstance(backbone_outputs, list):
             return [
                 self._format_branch_outputs(
@@ -677,6 +681,7 @@ class DinoVitStudentTeacher(nn.Module):
         return_teacher: bool = True,
         project_student_patch_tokens: bool = False,
         project_teacher_patch_tokens: bool = False,
+        is_causal: bool = False,
     ) -> dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]]:
         project_cls_tokens = mask_indices_list is None
         student_outputs = self._forward_branch(
@@ -686,6 +691,7 @@ class DinoVitStudentTeacher(nn.Module):
             project_cls_tokens=project_cls_tokens,
             project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
             view_kind="global",
+            is_causal=is_causal,
         )
         if mask_indices_list is None:
             outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
@@ -712,6 +718,7 @@ class DinoVitStudentTeacher(nn.Module):
                     masks=None,
                     project_cls_tokens=True,
                     view_kind="local",
+                    is_causal=is_causal,
                 )
             outputs = {"student": structured_student_outputs}
 

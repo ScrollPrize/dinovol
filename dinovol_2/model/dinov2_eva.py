@@ -99,9 +99,10 @@ class EvaAttention(nn.Module):
             x,
             rope: Optional[RopeEmbedding] = None,
             attn_mask: Optional[torch.Tensor] = None,
+            is_causal: bool = False,
     ):
         B, N, C = x.shape
-        
+
         if self.qkv is not None:
             if self.q_bias is None:
                 qkv = self.qkv(x)
@@ -118,30 +119,27 @@ class EvaAttention(nn.Module):
             q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)  # B, num_heads, N, C
             k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
             v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
-        
+
         if rope is not None:
             q = apply_rotary_embedding(q, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
             k = apply_rotary_embedding(k, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
-        
-        if self.fused_attn:
+
+        if not self.fused_attn:
+            raise RuntimeError("Fused attention should be used.")
+
+        dropout_p = self.attn_drop.p if self.training else 0.
+        if is_causal and attn_mask is None:
+            # Full triangular causality via SDPA's native is_causal path.
+            # This is the Flash Attention fast path and is required for
+            # tractable compute at small patch sizes (e.g. 8**3 gives N~=1728+).
             x = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_drop.p if self.training else 0.,
+                q, k, v, is_causal=True, dropout_p=dropout_p,
             )
         else:
-            raise RuntimeError("Fused attention should be used.")
-            q = q * self.scale
-            attn = (q @ k.transpose(-2, -1))
-            
-            if attn_mask is not None:
-                attn_mask = attn_mask.to(torch.bool)
-                attn = attn.masked_fill(~attn_mask[:, None, None, :], float("-inf"))
-            attn = attn.softmax(dim=-1)
-            
-            attn = self.attn_drop(attn)
-            x = attn @ v
-        
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=dropout_p,
+            )
+
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.norm(x)
         x = self.proj(x)
@@ -262,6 +260,7 @@ class EvaBlock(nn.Module):
             attn_mask: Optional[torch.Tensor] = None,
             rope_shape: Optional[Tuple[int, ...]] = None,
             rope_coords: Optional[RopeCoords] = None,
+            is_causal: bool = False,
     ):
         if rope is None and self.rope_embed is not None:
             if rope_coords is not None:
@@ -271,10 +270,10 @@ class EvaBlock(nn.Module):
                     raise ValueError("rope_shape must be provided when using per-block RoPE")
                 rope = self.rope_embed.get_embed(rope_shape)
         if self.gamma_1 is None:
-            x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
+            x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
             x = x + self.drop_path2(self.mlp(self.norm2(x)))
         else:
-            x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
+            x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal))
             x = x + self.drop_path2(self.gamma_2 * self.mlp(self.norm2(x)))
         return x
 
@@ -723,7 +722,14 @@ class Eva(nn.Module):
         slices = tuple(slice(start, start + size) for start, size in zip(starts, target_patch_shape))
         return x[(slice(None), slice(None), *slices)]
     
-    def prepare_tokens_with_masks(self, x, masks=None, *, view_kind: str = "global"):
+    def prepare_tokens_with_masks(
+        self,
+        x,
+        masks=None,
+        *,
+        view_kind: str = "global",
+        return_unmasked_patches: bool = False,
+    ):
         spatial = tuple(x.shape[2:])
         self._assert_patch_aligned(spatial, tuple(self.patch_size), context="input shape")
         if self.embedding_type == "deeper":
@@ -749,32 +755,45 @@ class Eva(nn.Module):
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         else:
             x = rearrange(x, 'b c d h w -> b (d h w) c').contiguous()
-        
+
+        # Capture pre-mask, pre-pos-embed patch embeddings for NEPA targets so
+        # that iBOT masking does not contaminate the autoregressive target
+        # sequence with mask_token activations.
+        unmasked_patch_embeddings = x.detach().clone() if return_unmasked_patches else None
+
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype), x)
-        
+
         target_patch_shape = tuple(dim // patch for dim, patch in zip(target_spatial, self.patch_size))
         x, rot_pos_embed = self._pos_embed(x, *target_spatial)
-        
+
+        if return_unmasked_patches:
+            return x, rot_pos_embed, target_patch_shape, unmasked_patch_embeddings
         return x, rot_pos_embed, target_patch_shape
-    
-    def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global"):
+
+    def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global", is_causal: bool = False):
         if not isinstance(x_list, list):
-            return self.forward_features(x_list, masks_list, view_kind=view_kind)
+            return self.forward_features(x_list, masks_list, view_kind=view_kind, is_causal=is_causal)
         output = []
         for x, masks in zip(x_list, masks_list):
-            x_out = self.forward_features(x, masks, view_kind=view_kind)
+            x_out = self.forward_features(x, masks, view_kind=view_kind, is_causal=is_causal)
             output.append(x_out)
         return output
-    
-    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
-        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+
+    def forward_features(self, x, masks=None, *, view_kind: str = "global", is_causal: bool = False):
+        if is_causal:
+            x, rot_pos_embed, rope_shape, input_patch_embeddings = self.prepare_tokens_with_masks(
+                x, masks, view_kind=view_kind, return_unmasked_patches=True,
+            )
+        else:
+            x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+            input_patch_embeddings = None
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords, is_causal=is_causal, use_reentrant=False)
             else:
-                x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords, is_causal=is_causal)
         x = self.norm(x)
         outputs = {
             "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
@@ -782,11 +801,12 @@ class Eva(nn.Module):
             "x_norm_patchtokens": x[:, self.num_prefix_tokens:],
             "x_prenorm": x,
             "masks": masks,
+            "x_input_patchtokens": input_patch_embeddings,
         }
         return outputs
-    
-    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
-        return self.forward_features_list(x, masks, view_kind=view_kind)
+
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global", is_causal: bool = False):
+        return self.forward_features_list(x, masks, view_kind=view_kind, is_causal=is_causal)
     
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
@@ -883,9 +903,9 @@ class Eva(nn.Module):
 
 
 class BlockChunk(nn.ModuleList):
-    def forward(self, x, rope=None, attn_mask=None, rope_shape=None, rope_coords=None):
+    def forward(self, x, rope=None, attn_mask=None, rope_shape=None, rope_coords=None, is_causal=False):
         for blk in self:
-            x = blk(x, rope=rope, attn_mask=attn_mask, rope_shape=rope_shape, rope_coords=rope_coords)
+            x = blk(x, rope=rope, attn_mask=attn_mask, rope_shape=rope_shape, rope_coords=rope_coords, is_causal=is_causal)
         return x
 
 
@@ -908,23 +928,29 @@ class EvaWithChunking(Eva):
             chunks.append(block_chunk)
         self.blocks = nn.ModuleList(chunks)
     
-    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
-        x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+    def forward_features(self, x, masks=None, *, view_kind: str = "global", is_causal: bool = False):
+        if is_causal:
+            x, rot_pos_embed, rope_shape, input_patch_embeddings = self.prepare_tokens_with_masks(
+                x, masks, view_kind=view_kind, return_unmasked_patches=True,
+            )
+        else:
+            x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+            input_patch_embeddings = None
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
-        
+
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords, is_causal=is_causal, use_reentrant=False)
                 else:
-                    x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords, is_causal=is_causal)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords, is_causal=is_causal, use_reentrant=False)
                 else:
-                    x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        
+                    x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords, is_causal=is_causal)
+
         x = self.norm(x)
         outputs = {
             "x_norm_clstoken": x[:, 0] if self.num_class_tokens > 0 else None,
@@ -932,11 +958,12 @@ class EvaWithChunking(Eva):
             "x_norm_patchtokens": x[:, self.num_prefix_tokens:],
             "x_prenorm": x,
             "masks": masks,
+            "x_input_patchtokens": input_patch_embeddings,
         }
         return outputs
-    
-    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
-        return self.forward_features_list(x, masks, view_kind=view_kind)
+
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global", is_causal: bool = False):
+        return self.forward_features_list(x, masks, view_kind=view_kind, is_causal=is_causal)
 
 
 class Dinov2PrimusEncL(Eva):

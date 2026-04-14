@@ -24,7 +24,7 @@ from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
-from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
+from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, NEPALoss, iBOTPatchLoss
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 
 
@@ -210,6 +210,11 @@ class DinoIBOTPretrainer:
             else None
         )
         
+        self.nepa_config = dict(self.config.get("nepa") or {})
+        self.do_nepa = bool(self.nepa_config.get("enabled", False))
+        self.nepa_loss_weight = float(self.nepa_config.get("loss_weight", 1.0))
+        self.nepa_loss = NEPALoss(shift=bool(self.nepa_config.get("shift", True))).to(self.device) if self.do_nepa else None
+
         self.dino_loss_weight = float(self.config.get("dino_loss_weight", 1.0))
         self.ibot_loss_weight = float(self.config.get("ibot_loss_weight", 1.0))
         self.koleo_loss_weight = float(self.config.get("koleo_loss_weight", 0.1))
@@ -217,6 +222,15 @@ class DinoIBOTPretrainer:
         self.do_dino = self.dino_loss_weight > 0.0
         self.do_ibot = self.ibot_loss_weight > 0.0
         self.do_koleo = self.koleo_loss_weight > 0.0 and self.do_dino
+        if self.do_nepa and (self.do_dino or self.do_ibot) and self.is_main_process:
+            print(
+                "[NEPA] warning: NEPA is enabled simultaneously with "
+                f"DINO ({self.dino_loss_weight}) / iBOT ({self.ibot_loss_weight}). "
+                "Under strict causal attention the student CLS only attends to itself, "
+                "so DINO targets degrade. Consider setting dino_loss_weight=0 and "
+                "ibot_loss_weight=0 when training with NEPA, or use a separate "
+                "NEPA-only recipe."
+            )
         self.centering = str(self.config.get("centering", "sinkhorn_knopp"))
         self.gram_img_level = bool(self.gram_config.get("img_level", True))
         self.gram_teacher_checkpoint = self.gram_config.get("teacher_checkpoint")
@@ -1063,6 +1077,7 @@ class DinoIBOTPretrainer:
             mask_indices_list=mask_indices,
             n_masked_patches=n_masked,
             return_teacher=return_teacher,
+            is_causal=self.do_nepa,
         )
 
     def verify_batch_pipeline(self, batch: Mapping[str, Any], step: int = 0) -> dict[str, Any]:
@@ -1164,11 +1179,22 @@ class DinoIBOTPretrainer:
                 gram_teacher_crops=gram_teacher_crops,
             )
 
+            if self.do_nepa and self.nepa_loss is not None:
+                input_embeds = student_global.get("input_patch_embeddings")
+                output_embeds = student_global["patch_tokens"]
+                if input_embeds is not None:
+                    nepa_loss = self.nepa_loss(input_embeds, output_embeds)
+                else:
+                    nepa_loss = global_crops.new_zeros(())
+            else:
+                nepa_loss = global_crops.new_zeros(())
+
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
+                self.gram_loss_weight * gram_loss +
+                self.nepa_loss_weight * nepa_loss
             )
 
         backbone = self.model_module.student.backbone
@@ -1299,6 +1325,7 @@ class DinoIBOTPretrainer:
                 "ibot": float(ibot_loss.detach().item()),
                 "koleo": float(koleo_loss.detach().item()),
                 "gram": float(gram_loss.detach().item()),
+                "nepa": float(nepa_loss.detach().item()),
                 "term_count": total_terms,
             },
             "checks": checks,
@@ -1475,11 +1502,22 @@ class DinoIBOTPretrainer:
                 gram_teacher_crops=gram_teacher_crops,
             )
 
+            if self.do_nepa and self.nepa_loss is not None:
+                input_embeds = student_global.get("input_patch_embeddings")
+                output_embeds = student_global["patch_tokens"]
+                if input_embeds is not None:
+                    nepa_loss = self.nepa_loss(input_embeds, output_embeds)
+                else:
+                    nepa_loss = global_crops.new_zeros(())
+            else:
+                nepa_loss = global_crops.new_zeros(())
+
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
+                self.gram_loss_weight * gram_loss +
+                self.nepa_loss_weight * nepa_loss
             )
 
         self.scaler.scale(loss).backward()
@@ -1497,7 +1535,9 @@ class DinoIBOTPretrainer:
             "ibot_loss": float(ibot_loss.detach()),
             "koleo_loss": float(koleo_loss.detach()),
             "gram_loss": float(gram_loss.detach()),
+            "nepa_loss": float(nepa_loss.detach()),
             "gram_loss_weight": float(self.gram_loss_weight),
+            "nepa_loss_weight": float(self.nepa_loss_weight),
             "lr": lr,
             "weight_decay": weight_decay,
             "teacher_temp": teacher_temp,
@@ -1679,11 +1719,12 @@ class DinoIBOTPretrainer:
         canvas = np.concatenate(rows, axis=0) if rows else np.zeros((256, 256, 3), dtype=np.uint8)
         image_path = self.monitor_dir / f"monitor_step_{step:06d}.jpg"
         Image.fromarray(canvas).save(image_path, quality=90)
+        nepa_str = f" nepa={metrics['nepa_loss']:.4f}" if "nepa_loss" in metrics else ""
         print(
             f"step={step} monitor_image={image_path.name} "
             f"loss={metrics['loss']:.4f} glob={metrics['dino_global_loss']:.4f} "
             f"loc={metrics['dino_local_loss']:.4f} ibot={metrics['ibot_loss']:.4f} "
-            f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f}"
+            f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f}{nepa_str}"
         )
         return image_path
     
@@ -1768,11 +1809,22 @@ class DinoIBOTPretrainer:
                 gram_teacher_crops=gram_teacher_crops,
             )
 
+            if self.do_nepa and self.nepa_loss is not None:
+                input_embeds = student_global.get("input_patch_embeddings")
+                output_embeds = student_global["patch_tokens"]
+                if input_embeds is not None:
+                    nepa_loss = self.nepa_loss(input_embeds, output_embeds)
+                else:
+                    nepa_loss = global_crops.new_zeros(())
+            else:
+                nepa_loss = global_crops.new_zeros(())
+
             loss = (
                 self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
+                self.gram_loss_weight * gram_loss +
+                self.nepa_loss_weight * nepa_loss
             )
 
         return {
@@ -1782,7 +1834,9 @@ class DinoIBOTPretrainer:
             "ibot_loss": float(ibot_loss.detach()),
             "koleo_loss": float(koleo_loss.detach()),
             "gram_loss": float(gram_loss.detach()),
+            "nepa_loss": float(nepa_loss.detach()),
             "gram_loss_weight": float(self.gram_loss_weight),
+            "nepa_loss_weight": float(self.nepa_loss_weight),
             "teacher_temp": teacher_temp,
         }
 
@@ -1853,14 +1907,17 @@ class DinoIBOTPretrainer:
                 
                 metrics = self._average_metrics(self.train_step(batch, step))
                 if progress is not None:
-                    progress.set_postfix(
-                        loss=f"{metrics['loss']:.4f}",
-                        glob_loss=f"{metrics['dino_global_loss']:.4f}",
-                        loc_loss=f"{metrics['dino_local_loss']:.4f}",
-                        ibot_loss=f"{metrics['ibot_loss']:.4f}",
-                        koleo_loss=f"{metrics['koleo_loss']:.4f}",
-                        gram_loss=f"{metrics['gram_loss']:.4f}",
-                    )
+                    postfix = {
+                        "loss": f"{metrics['loss']:.4f}",
+                        "glob_loss": f"{metrics['dino_global_loss']:.4f}",
+                        "loc_loss": f"{metrics['dino_local_loss']:.4f}",
+                        "ibot_loss": f"{metrics['ibot_loss']:.4f}",
+                        "koleo_loss": f"{metrics['koleo_loss']:.4f}",
+                        "gram_loss": f"{metrics['gram_loss']:.4f}",
+                    }
+                    if self.do_nepa:
+                        postfix["nepa_loss"] = f"{metrics['nepa_loss']:.4f}"
+                    progress.set_postfix(**postfix)
                     progress.update(1)
                 if self.is_main_process:
                     self._log_wandb_metrics("train", metrics, step=step)
