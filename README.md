@@ -1,3 +1,17 @@
+## Pretrained checkpoint
+
+A pretrained teacher checkpoint (`v2` backbone, patch size 8, `paris4` run, step 352500;
+215.9M-param backbone) is published on HuggingFace:
+**[scrollprize/dinovol_v2_ps8_with_paris4_352500](https://huggingface.co/scrollprize/dinovol_v2_ps8_with_paris4_352500)**
+— part of the [Representation collection](https://huggingface.co/collections/scrollprize/representation-67e1b44299d5c18f5845874f).
+
+The repo provides a slim teacher-backbone file for inference and the full training
+checkpoint for resuming. Load it with
+`dinovol_2/eval/embedding_utils.py::load_backbone_from_checkpoint` (the model config
+travels inside the weights, so the architecture is rebuilt automatically).
+
+---
+
 an attempt at a faithful implementation of dinov2-style pretraining on 3d volumes. 
 
 - the dinov2_eva is from [dynamic-network-architectures](github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/architectures/dinov2_eva.py) , with some minimal changes
