@@ -47,6 +47,10 @@ from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 
 
+_COMPILE_SCOPES = {"blocks", "heads", "blocks_and_heads"}
+_COMPILE_MODES = {"default", "max-autotune-no-cudagraphs", "max-autotune", "reduce-overhead"}
+
+
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
     if value is None:
         return default
@@ -158,6 +162,8 @@ class DinoIBOTPretrainer:
         self.data_parallel_ranks: tuple[int, ...] = tuple(range(self.world_size)) if self.is_distributed else (0,)
         self.data_parallel_mesh: DeviceMesh | None = None
         self._fsdp_replicated_param_sync_handles: list[Any] = []
+        self.compile_config = self._resolve_compile_config(self.config.get("compile"))
+        self.compiled_module_names: tuple[str, ...] = ()
 
         configured_device_name = self.config.get("device")
         configured_device = torch.device(configured_device_name) if configured_device_name is not None else None
@@ -291,6 +297,7 @@ class DinoIBOTPretrainer:
                 world_size=self.context_parallel_size,
             )
         self._configure_deeper_embed_overscan()
+        self._apply_compile_if_configured()
         self._prepare_fsdp_activation_checkpointing()
         self._apply_sharding_if_configured()
         self.optimizer = self._build_optimizer()
@@ -435,6 +442,113 @@ class DinoIBOTPretrainer:
         if isinstance(self.model, DDP):
             return self.model.module
         return self.model
+
+    @staticmethod
+    def _resolve_compile_config(value: Any) -> dict[str, Any]:
+        if value is None:
+            value = {}
+        if not isinstance(value, Mapping):
+            raise ValueError("compile must be a mapping when provided.")
+
+        enabled = bool(value.get("enabled", False))
+        scope = str(value.get("scope", "blocks")).strip().lower()
+        if scope not in _COMPILE_SCOPES:
+            raise ValueError(
+                "compile.scope must be one of "
+                f"{sorted(_COMPILE_SCOPES)}, got {scope!r}."
+            )
+
+        backend = str(value.get("backend", "inductor")).strip()
+        if not backend:
+            raise ValueError("compile.backend must be a non-empty string.")
+
+        mode_value = value.get("mode", "default")
+        if mode_value is None:
+            mode = None
+        else:
+            mode = str(mode_value).strip().lower()
+            if mode in {"", "none", "null"}:
+                mode = None
+            elif mode not in _COMPILE_MODES:
+                raise ValueError(
+                    "compile.mode must be one of "
+                    f"{sorted(_COMPILE_MODES)} or null, got {mode!r}."
+                )
+
+        dynamic_value = value.get("dynamic", False)
+        if dynamic_value is None:
+            dynamic: bool | None = None
+        elif isinstance(dynamic_value, str) and dynamic_value.strip().lower() in {"none", "auto"}:
+            dynamic = None
+        else:
+            dynamic = bool(dynamic_value)
+
+        return {
+            "enabled": enabled,
+            "scope": scope,
+            "backend": backend,
+            "mode": mode,
+            "fullgraph": bool(value.get("fullgraph", False)),
+            "dynamic": dynamic,
+        }
+
+    def _compile_kwargs(self) -> dict[str, Any]:
+        kwargs = {
+            "backend": self.compile_config["backend"],
+            "fullgraph": self.compile_config["fullgraph"],
+            "dynamic": self.compile_config["dynamic"],
+        }
+        if self.compile_config["mode"] is not None:
+            kwargs["mode"] = self.compile_config["mode"]
+        return kwargs
+
+    def _iter_compile_blocks(self) -> Iterator[tuple[str, torch.nn.Module]]:
+        for branch_name in ("student", "teacher"):
+            branch = getattr(self.model, branch_name)
+            backbone = branch.backbone
+            blocks = getattr(backbone, "blocks", None)
+            if blocks is None:
+                continue
+            for block_index, block in enumerate(blocks):
+                if isinstance(block, torch.nn.ModuleList):
+                    for sub_index, sub_block in enumerate(block):
+                        yield f"{branch_name}.backbone.blocks.{block_index}.{sub_index}", sub_block
+                else:
+                    yield f"{branch_name}.backbone.blocks.{block_index}", block
+
+    def _iter_compile_heads(self) -> Iterator[tuple[str, torch.nn.Module]]:
+        for branch_name in ("student", "teacher"):
+            branch = getattr(self.model, branch_name)
+            yield f"{branch_name}.dino_head", branch.dino_head
+            yield f"{branch_name}.ibot_head", branch.ibot_head
+
+    def _iter_compile_modules(self) -> Iterator[tuple[str, torch.nn.Module]]:
+        scope = str(self.compile_config["scope"])
+        if scope in {"blocks", "blocks_and_heads"}:
+            yield from self._iter_compile_blocks()
+        if scope in {"heads", "blocks_and_heads"}:
+            yield from self._iter_compile_heads()
+
+    def _apply_compile_if_configured(self) -> None:
+        if not bool(self.compile_config["enabled"]):
+            return
+        if not hasattr(torch.nn.Module, "compile"):
+            raise RuntimeError("torch.nn.Module.compile is unavailable in this PyTorch build.")
+
+        compile_kwargs = self._compile_kwargs()
+        compiled: list[str] = []
+        for module_name, module in self._iter_compile_modules():
+            module.compile(**compile_kwargs)
+            compiled.append(module_name)
+        self.compiled_module_names = tuple(compiled)
+
+        if self.is_main_process:
+            print(
+                "torch_compile="
+                f"enabled scope={self.compile_config['scope']} backend={self.compile_config['backend']} "
+                f"mode={self.compile_config['mode']} fullgraph={self.compile_config['fullgraph']} "
+                f"dynamic={self.compile_config['dynamic']} modules={len(self.compiled_module_names)}"
+            )
 
     def _extract_backbone_state_dict(self, state_dict: Mapping[str, Any]) -> dict[str, Any]:
         state_dict = dict(state_dict)

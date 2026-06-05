@@ -48,9 +48,17 @@
     "distributed": true
   },
   "ibot": {
-    "max_masked_patches_per_rank": 20000,
+    "max_masked_patches_per_rank": 16384,
     "projection_chunk_size": 1024,
     "loss_chunk_size": 1024
+  },
+  "compile": {
+    "enabled": true,
+    "scope": "blocks",
+    "backend": "inductor",
+    "mode": "default",
+    "fullgraph": false,
+    "dynamic": false
   },
   "model": {
     "global_crops_size": [256, 256, 256],

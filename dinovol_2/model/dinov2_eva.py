@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
-from timm.layers import trunc_normal_, use_fused_attn, DropPath, SwiGLU, GluMlp, Mlp
+from timm.layers import trunc_normal_, use_fused_attn, SwiGLU, GluMlp, Mlp
 from torch import nn
 from torch.nn import LayerNorm
 from torch.utils.checkpoint import checkpoint
@@ -61,6 +61,35 @@ def _reduce_from_tensor_parallel_region(x: torch.Tensor, process_group):
 
 def _unwrap_checkpoint_module(module: nn.Module) -> nn.Module:
     return getattr(module, "_checkpoint_wrapped_module", module)
+
+
+class CompileStableDropPath(nn.Module):
+    """Stochastic depth without Python-value guards on per-block drop rates."""
+
+    def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+        self.scale_by_keep = bool(scale_by_keep)
+        self.register_buffer(
+            "_drop_prob_tensor",
+            torch.tensor(self.drop_prob, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return x
+        keep_prob = (1.0 - self._drop_prob_tensor).to(device=x.device)
+        keep_prob = keep_prob.clamp_min(torch.finfo(torch.float32).tiny)
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, device=x.device, dtype=torch.float32) < keep_prob
+        random_tensor = random_tensor.to(dtype=x.dtype)
+        if self.scale_by_keep:
+            random_tensor = random_tensor / keep_prob.to(dtype=x.dtype)
+        return x * random_tensor
+
+    def extra_repr(self) -> str:
+        return f"drop_prob={round(self.drop_prob, 3):0.3f}"
 
 
 class InitWeights_He(object):
@@ -720,7 +749,7 @@ class EvaBlock(nn.Module):
                 **rope_kwargs_local,
             )
         self.gamma_1 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
-        self.drop_path1 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
+        self.drop_path1 = CompileStableDropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
         
         self.norm2 = norm_layer(dim)
         hidden_features = int(dim * mlp_ratio)
@@ -752,7 +781,7 @@ class EvaBlock(nn.Module):
                 drop=proj_drop,
             )
         self.gamma_2 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
-        self.drop_path2 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
+        self.drop_path2 = CompileStableDropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
         self.mlp_token_chunk_size = self._normalize_optional_positive_int(
             mlp_token_chunk_size,
             name="mlp_token_chunk_size",

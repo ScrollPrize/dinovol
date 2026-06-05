@@ -13,12 +13,13 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from dinovol_2.config import load_config
 from dinovol_2.loss import KoLeoLoss, iBOTPatchLoss
-from dinovol_2.model.dinov2_eva import EvaAttention, EvaBlock
+from dinovol_2.model.dinov2_eva import CompileStableDropPath, EvaAttention, EvaBlock
 from dinovol_2.model.model import DinoVitStudentTeacher
 from dinovol_2.model.rope import MixedRopePositionEmbedding
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import resolve_distributed_config
 from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
+from dinovol_2.pretrain import DinoIBOTPretrainer
 
 
 def _fake_sample(global_size: int = 16, local_size: int = 8) -> dict:
@@ -28,6 +29,31 @@ def _fake_sample(global_size: int = 16, local_size: int = 8) -> dict:
             torch.ones((1, global_size, global_size, global_size)),
         ],
         "local_views": [torch.zeros((1, local_size, local_size, local_size))],
+    }
+
+
+def _tiny_compile_model_config() -> dict:
+    return {
+        "model_type": "v2",
+        "input_channels": 1,
+        "global_crops_size": [8, 8, 8],
+        "local_crops_size": [4, 4, 4],
+        "patch_size": [4, 4, 4],
+        "embed_dim": 24,
+        "depth": 2,
+        "num_heads": 4,
+        "num_reg_tokens": 1,
+        "dino_out_dim": 16,
+        "ibot_out_dim": 16,
+        "dino_head_hidden_dim": 32,
+        "dino_head_bottleneck_dim": 16,
+        "ibot_head_hidden_dim": 32,
+        "ibot_head_bottleneck_dim": 16,
+        "use_abs_pos_emb": False,
+        "use_rot_pos_emb": False,
+        "drop_path_rate": 0.0,
+        "block_chunks": 1,
+        "masked_projection_chunk_size": 2,
     }
 
 
@@ -155,6 +181,134 @@ def _context_parallel_masked_gather_worker(rank: int, world_size: int, init_file
 
 
 class ParallelismSupportTests(unittest.TestCase):
+    def test_compile_config_validation(self) -> None:
+        default = DinoIBOTPretrainer._resolve_compile_config(None)
+        self.assertFalse(default["enabled"])
+        self.assertEqual(default["scope"], "blocks")
+        self.assertEqual(default["backend"], "inductor")
+        self.assertEqual(default["mode"], "default")
+        self.assertFalse(default["fullgraph"])
+        self.assertFalse(default["dynamic"])
+
+        configured = DinoIBOTPretrainer._resolve_compile_config(
+            {
+                "enabled": True,
+                "scope": "blocks_and_heads",
+                "backend": "inductor",
+                "mode": "max-autotune",
+                "fullgraph": True,
+                "dynamic": "auto",
+            }
+        )
+        self.assertTrue(configured["enabled"])
+        self.assertEqual(configured["scope"], "blocks_and_heads")
+        self.assertEqual(configured["mode"], "max-autotune")
+        self.assertTrue(configured["fullgraph"])
+        self.assertIsNone(configured["dynamic"])
+
+        diagnostic = DinoIBOTPretrainer._resolve_compile_config({"enabled": True, "mode": "reduce-overhead"})
+        self.assertEqual(diagnostic["mode"], "reduce-overhead")
+
+        with self.assertRaisesRegex(ValueError, "compile.scope"):
+            DinoIBOTPretrainer._resolve_compile_config({"scope": "everything"})
+        with self.assertRaisesRegex(ValueError, "compile.mode"):
+            DinoIBOTPretrainer._resolve_compile_config({"mode": "fastest"})
+
+    def test_compile_blocks_and_heads_preserves_state_dict_keys(self) -> None:
+        model = DinoVitStudentTeacher(_tiny_compile_model_config()).eval()
+        trainer = object.__new__(DinoIBOTPretrainer)
+        trainer.model = model
+        trainer.rank = 1
+        trainer.compiled_module_names = ()
+        trainer.compile_config = DinoIBOTPretrainer._resolve_compile_config(
+            {
+                "enabled": True,
+                "scope": "blocks_and_heads",
+                "backend": "eager",
+                "mode": "default",
+            }
+        )
+
+        before_keys = tuple(model.state_dict().keys())
+        trainer._apply_compile_if_configured()
+        after_keys = tuple(model.state_dict().keys())
+
+        self.assertEqual(after_keys, before_keys)
+        self.assertEqual(len(trainer.compiled_module_names), 8)
+        self.assertIn("student.backbone.blocks.0.0", trainer.compiled_module_names)
+        self.assertIn("teacher.ibot_head", trainer.compiled_module_names)
+
+    def test_compile_stable_drop_path_preserves_basic_semantics(self) -> None:
+        x = torch.ones(32, 4, 3)
+        zero = CompileStableDropPath(0.0).train()
+        self.assertTrue(torch.equal(zero(x), x))
+
+        drop = CompileStableDropPath(0.5).train()
+        torch.manual_seed(123)
+        y = drop(x)
+        self.assertEqual(y.shape, x.shape)
+        self.assertTrue(torch.isfinite(y).all())
+        self.assertTrue(set(torch.unique(y).tolist()).issubset({0.0, 2.0}))
+
+        drop.eval()
+        self.assertTrue(torch.equal(drop(x), x))
+
+    def test_compile_blocks_and_heads_matches_eager_forward(self) -> None:
+        torch.manual_seed(11)
+        eager = DinoVitStudentTeacher(_tiny_compile_model_config()).eval()
+        compiled = DinoVitStudentTeacher(_tiny_compile_model_config()).eval()
+        compiled.load_state_dict(eager.state_dict())
+
+        trainer = object.__new__(DinoIBOTPretrainer)
+        trainer.model = compiled
+        trainer.rank = 1
+        trainer.compiled_module_names = ()
+        trainer.compile_config = DinoIBOTPretrainer._resolve_compile_config(
+            {
+                "enabled": True,
+                "scope": "blocks_and_heads",
+                "backend": "eager",
+                "mode": "default",
+            }
+        )
+        trainer._apply_compile_if_configured()
+
+        student_input = torch.randn(2, 1, 8, 8, 8)
+        local_input = torch.randn(2, 1, 4, 4, 4)
+        masks = torch.zeros(2, 8, dtype=torch.bool)
+        mask_indices = torch.tensor([0, 9], dtype=torch.long)
+
+        def assert_nested_close(left: object, right: object) -> None:
+            if isinstance(left, torch.Tensor):
+                self.assertIsInstance(right, torch.Tensor)
+                self.assertTrue(torch.allclose(left, right, atol=1e-6, rtol=1e-6))
+                return
+            self.assertIsInstance(left, dict)
+            self.assertIsInstance(right, dict)
+            self.assertEqual(set(left.keys()), set(right.keys()))
+            for key in left:
+                assert_nested_close(left[key], right[key])
+
+        with torch.no_grad():
+            eager_outputs = eager(
+                student_input,
+                student_masks=masks,
+                local_student_input=local_input,
+                mask_indices_list=mask_indices,
+                n_masked_patches=2,
+                return_teacher=True,
+            )
+            compiled_outputs = compiled(
+                student_input,
+                student_masks=masks,
+                local_student_input=local_input,
+                mask_indices_list=mask_indices,
+                n_masked_patches=2,
+                return_teacher=True,
+            )
+
+        assert_nested_close(eager_outputs, compiled_outputs)
+
     def test_config_expands_env_and_datasets_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

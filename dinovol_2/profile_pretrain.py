@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from contextlib import nullcontext
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -232,6 +233,14 @@ def run_profile(
             "context_parallel_size": trainer.context_parallel_size,
             "parallelism_sharding": trainer.parallelism_sharding,
             "attention_mode": str(trainer.model_config.get("attention_mode", "dense")),
+            "compile": {
+                **trainer.compile_config,
+                "compiled_modules": list(trainer.compiled_module_names),
+                "compiled_module_count": len(trainer.compiled_module_names),
+                "torch_logs": str(os.environ.get("TORCH_LOGS", "")),
+                "torch_trace": str(os.environ.get("TORCH_TRACE", "")),
+                "torchinductor_cache_dir": str(os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")),
+            },
             "sdpa_backend": _sdpa_backend_stats(trainer.device),
             "rank_reports": gathered,
         }
