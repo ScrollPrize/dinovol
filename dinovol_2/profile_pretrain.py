@@ -131,9 +131,12 @@ def run_profile(
         config["resume"] = False
         config["auto_resume"] = False
         config.pop("resume_from", None)
-    config.setdefault("wandb_project", None)
-    config.setdefault("val_every_n", 0)
-    config.setdefault("save_every_n", 0)
+    config["wandb-project"] = None
+    config["wandb_project"] = None
+    config["wandb-run-name"] = None
+    config["wandb_run_name"] = None
+    config["val_every_n"] = 0
+    config["save_every_n"] = 0
 
     trainer = DinoIBOTPretrainer(config)
     dataloader = trainer.build_dataloader()
