@@ -370,6 +370,10 @@ class DinoVitStudentTeacher(nn.Module):
     def __init__(self, config: Mapping[str, Any]) -> None:
         super().__init__()
         self.config = dict(config)
+        self.masked_projection_chunk_size = self._resolve_positive_optional_int(
+            self.config.get("ibot_projection_chunk_size", self.config.get("masked_projection_chunk_size")),
+            name="ibot_projection_chunk_size",
+        )
         student_backbone = self._build_backbone(self.config)
         teacher_backbone = deepcopy(student_backbone)
 
@@ -397,6 +401,15 @@ class DinoVitStudentTeacher(nn.Module):
 
         self.synchronize_teacher_from_student()
         self._freeze_teacher()
+
+    @staticmethod
+    def _resolve_positive_optional_int(value: Any, *, name: str) -> int | None:
+        if value is None:
+            return None
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f"{name} must be positive when set, got {value}")
+        return value
 
     @staticmethod
     def _build_backbone(config: Mapping[str, Any]) -> nn.Module:
@@ -552,6 +565,25 @@ class DinoVitStudentTeacher(nn.Module):
         return projections.reshape(*leading_shape, projections.shape[-1])
 
     @staticmethod
+    def _apply_head_chunked(head: nn.Module, tokens: torch.Tensor, chunk_size: int | None) -> torch.Tensor:
+        if chunk_size is None:
+            return DinoVitStudentTeacher._apply_head(head, tokens)
+        if tokens.ndim == 2:
+            if tokens.shape[0] <= chunk_size:
+                return head(tokens)
+            return torch.cat([head(tokens[start:start + chunk_size]) for start in range(0, tokens.shape[0], chunk_size)], dim=0)
+        leading_shape = tokens.shape[:-1]
+        flat = tokens.reshape(-1, tokens.shape[-1])
+        if flat.shape[0] <= chunk_size:
+            projections = head(flat)
+        else:
+            projections = torch.cat(
+                [head(flat[start:start + chunk_size]) for start in range(0, flat.shape[0], chunk_size)],
+                dim=0,
+            )
+        return projections.reshape(*leading_shape, projections.shape[-1])
+
+    @staticmethod
     def select_masked_tokens(
         tokens: torch.Tensor,
         mask_indices_list: torch.Tensor,
@@ -582,7 +614,7 @@ class DinoVitStudentTeacher(nn.Module):
         return self._apply_head(branch.dino_head, cls_tokens)
 
     def project_patch_tokens(self, branch: nn.ModuleDict, patch_tokens: torch.Tensor) -> torch.Tensor:
-        return self._apply_head(branch.ibot_head, patch_tokens)
+        return self._apply_head_chunked(branch.ibot_head, patch_tokens, self.masked_projection_chunk_size)
 
     def project_masked_patch_tokens(
         self,
@@ -596,7 +628,7 @@ class DinoVitStudentTeacher(nn.Module):
             mask_indices_list=mask_indices_list,
             n_masked_patches=n_masked_patches,
         )
-        return self.project_patch_tokens(branch, masked_tokens)
+        return self._apply_head_chunked(branch.ibot_head, masked_tokens, self.masked_projection_chunk_size)
 
     def project_global_cls_and_masked_patch_tokens(
         self,
@@ -744,3 +776,27 @@ class DinoVitStudentTeacher(nn.Module):
                     }
                     outputs["teacher"] = teacher_structured_outputs
         return outputs
+
+    def set_tensor_parallel(
+        self,
+        *,
+        process_group=None,
+        ranks: tuple[int, ...] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        for backbone in (self.student.backbone, self.teacher.backbone):
+            set_tensor_parallel = getattr(backbone, "set_tensor_parallel", None)
+            if callable(set_tensor_parallel):
+                set_tensor_parallel(
+                    process_group=process_group,
+                    ranks=ranks,
+                    rank=rank,
+                    world_size=world_size,
+                )
+
+    def sync_tensor_parallel_parameters(self, optimizer: torch.optim.Optimizer | None = None) -> None:
+        for backbone in (self.student.backbone, self.teacher.backbone):
+            sync_tensor_parallel_parameters = getattr(backbone, "sync_tensor_parallel_parameters", None)
+            if callable(sync_tensor_parallel_parameters):
+                sync_tensor_parallel_parameters(optimizer=optimizer)

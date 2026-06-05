@@ -123,6 +123,52 @@ To run the synthetic smoke suite:
 uv run python -m unittest tests.test_pretrain_smoke -v
 ```
 
+## Patch-4 Multi-Node Pretraining
+
+Patch-4 128³/64³ crops are supported through a `tp_ddp` strategy intended for
+H100-class multi-node runs. The implementation keeps tensor-parallel groups
+node-local, shards EVA attention heads across each tensor-parallel group, uses
+data parallelism across groups, gathers KoLeo CLS tokens across the data-parallel
+group, and caps/chunks iBOT masked-token projection and loss.
+
+Relevant config keys:
+
+- `amp_dtype`: `auto`, `bf16`, `fp16`, or `off`
+- `parallelism.strategy`: `ddp` or `tp_ddp`
+- `parallelism.tensor_parallel_size`: tensor-parallel group size; patch-4 H100
+  runs should start at `4` and move to `8` if memory remains above target
+- `koleo.distributed`: gather CLS tokens across data-parallel ranks before KoLeo
+- `ibot.max_masked_patches_per_rank`: absolute cap on selected masked patches
+- `ibot.projection_chunk_size` and `ibot.loss_chunk_size`: iBOT memory controls
+- `distributed_timeout_seconds`: process-group timeout for slower multi-node starts
+
+The production template is `configs/patch4_tpddp_h100_template.json`. It uses
+environment placeholders for outputs and dataset manifests, so host names,
+credentials, storage URLs, and machine-local paths stay outside the repository.
+
+Synthetic profiler smoke setup:
+
+```bash
+RUN_DIR="$PWD/.scratch/dinovol_profile"
+mkdir -p "$RUN_DIR"
+uv run python scripts/create_synthetic_zarr.py "$RUN_DIR/synthetic.zarr" --shape 224
+OUTPUT_DIR="$RUN_DIR/output" SYNTHETIC_ZARR="$RUN_DIR/synthetic.zarr" \
+  uv run python -m dinovol_2.profile_pretrain configs/synthetic_patch4_smoke.json --steps 1 --no-resume
+```
+
+Multi-node launch template:
+
+```bash
+CONFIG=configs/patch4_tpddp_h100_template.json \
+NNODES="$NNODES" NODE_RANK="$NODE_RANK" MASTER_ADDR="$MASTER_ADDR" \
+  scripts/launch_multinode_pretrain.sh
+```
+
+For profiling under torchrun, set `MODULE=dinovol_2.profile_pretrain` and pass
+profile arguments after the script name. Sequence/context parallelism, FSDP/ZeRO,
+and sparse/windowed attention are not implemented here; patch-3 is experimental,
+and patch-2 still requires an architectural attention change.
+
 ## Optional Task Eval During Pretraining
 
 `pretrain.py` can optionally run small downstream segmentation trainings during pretraining.

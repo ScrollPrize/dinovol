@@ -15,15 +15,27 @@ class DINOLoss(nn.Module):
         out_dim,
         student_temp=0.1,
         center_momentum=0.9,
+        process_group=None,
     ):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
+        self.process_group = process_group
         self.register_buffer("center", torch.zeros(1, out_dim))
         self.updated = True
         self.reduce_handle = None
         self.len_teacher_output = None
         self.async_batch_center = None
+
+    def set_process_group(self, process_group) -> None:
+        self.process_group = process_group
+
+    def _distributed_world_size(self) -> int:
+        if not dist.is_initialized():
+            return 1
+        if self.process_group is None:
+            return dist.get_world_size()
+        return dist.get_world_size(group=self.process_group)
 
     @torch.no_grad()
     def softmax_center_teacher(self, teacher_output, teacher_temp):
@@ -34,7 +46,7 @@ class DINOLoss(nn.Module):
     @torch.no_grad()
     def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_iterations=3):
         teacher_output = teacher_output.float()
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        world_size = self._distributed_world_size()
         Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
         B = Q.shape[1] * world_size  # number of samples to assign
         K = Q.shape[0]  # how many prototypes
@@ -42,14 +54,14 @@ class DINOLoss(nn.Module):
         # make the matrix sums to 1
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
-            dist.all_reduce(sum_Q)
+            dist.all_reduce(sum_Q, group=self.process_group)
         Q /= sum_Q
 
         for it in range(n_iterations):
             # normalize each row: total weight per prototype must be 1/K
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
-                dist.all_reduce(sum_of_rows)
+                dist.all_reduce(sum_of_rows, group=self.process_group)
             Q /= sum_of_rows
             Q /= K
 
@@ -85,12 +97,16 @@ class DINOLoss(nn.Module):
         self.len_teacher_output = len(teacher_output)
         self.async_batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
         if dist.is_initialized():
-            self.reduce_handle = dist.all_reduce(self.async_batch_center, async_op=True)
+            self.reduce_handle = dist.all_reduce(
+                self.async_batch_center,
+                async_op=True,
+                group=self.process_group,
+            )
 
     @torch.no_grad()
     def apply_center_update(self):
         if self.updated is False:
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            world_size = self._distributed_world_size()
 
             if self.reduce_handle is not None:
                 self.reduce_handle.wait()

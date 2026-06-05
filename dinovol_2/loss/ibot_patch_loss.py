@@ -40,6 +40,7 @@ class iBOTPatchLoss(nn.Module):
         student_temp=0.1,
         center_momentum=0.9,
         masked_loss_chunk_size: int | None = None,
+        process_group=None,
     ):
         super().__init__()
         if masked_loss_chunk_size is not None and masked_loss_chunk_size <= 0:
@@ -47,11 +48,22 @@ class iBOTPatchLoss(nn.Module):
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.masked_loss_chunk_size = masked_loss_chunk_size
+        self.process_group = process_group
         self.register_buffer("center", torch.zeros(1, 1, patch_out_dim))
         self.updated = True
         self.reduce_handle = None
         self.len_teacher_patch_tokens = None
         self.async_batch_center = None
+
+    def set_process_group(self, process_group) -> None:
+        self.process_group = process_group
+
+    def _distributed_world_size(self) -> int:
+        if not dist.is_initialized():
+            return 1
+        if self.process_group is None:
+            return dist.get_world_size()
+        return dist.get_world_size(group=self.process_group)
 
     @torch.no_grad()
     def softmax_center_teacher(self, teacher_patch_tokens, teacher_temp):
@@ -77,20 +89,20 @@ class iBOTPatchLoss(nn.Module):
         # B = Q.shape[1] * world_size # number of samples to assign
         B = n_masked_patches_tensor
         if dist.is_initialized():
-            dist.all_reduce(B)
+            dist.all_reduce(B, group=self.process_group)
         K = Q.shape[0]  # how many prototypes
 
         # make the matrix sums to 1
         sum_Q = torch.sum(Q)
         if dist.is_initialized():
-            dist.all_reduce(sum_Q)
+            dist.all_reduce(sum_Q, group=self.process_group)
         Q /= sum_Q
 
         for it in range(n_iterations):
             # normalize each row: total weight per prototype must be 1/K
             sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
             if dist.is_initialized():
-                dist.all_reduce(sum_of_rows)
+                dist.all_reduce(sum_of_rows, group=self.process_group)
             Q /= sum_of_rows
             Q /= K
 
@@ -165,12 +177,16 @@ class iBOTPatchLoss(nn.Module):
             batch_centers = (teacher_patch_tokens * weights).sum(dim=1) / denom
         self.async_batch_center = torch.sum(batch_centers, dim=0, keepdim=True)
         if dist.is_initialized():
-            self.reduce_handle = dist.all_reduce(self.async_batch_center, async_op=True)
+            self.reduce_handle = dist.all_reduce(
+                self.async_batch_center,
+                async_op=True,
+                group=self.process_group,
+            )
 
     @torch.no_grad()
     def apply_center_update(self):
         if self.updated is False:
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            world_size = self._distributed_world_size()
 
             if self.reduce_handle is not None:
                 self.reduce_handle.wait()

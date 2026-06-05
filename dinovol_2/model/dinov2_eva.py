@@ -4,6 +4,7 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from timm.layers import trunc_normal_, use_fused_attn, DropPath, SwiGLU, GluMlp, Mlp
 from torch import nn
@@ -19,6 +20,42 @@ from dinovol_2.model.rope import (
     RopePositionEmbedding,
     apply_rotary_embedding,
 )
+
+
+class _CopyToTensorParallelRegion(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, process_group):
+        ctx.process_group = process_group
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.process_group is not None and dist.is_available() and dist.is_initialized():
+            grad_output = grad_output.contiguous()
+            dist.all_reduce(grad_output, group=ctx.process_group)
+        return grad_output, None
+
+
+class _ReduceFromTensorParallelRegion(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, process_group):
+        ctx.process_group = process_group
+        if process_group is not None and dist.is_available() and dist.is_initialized():
+            x = x.contiguous()
+            dist.all_reduce(x, group=process_group)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+def _copy_to_tensor_parallel_region(x: torch.Tensor, process_group):
+    return _CopyToTensorParallelRegion.apply(x, process_group)
+
+
+def _reduce_from_tensor_parallel_region(x: torch.Tensor, process_group):
+    return _ReduceFromTensorParallelRegion.apply(x, process_group)
 
 
 class InitWeights_He(object):
@@ -93,6 +130,184 @@ class EvaAttention(nn.Module):
         self.norm = norm_layer(all_head_dim) if norm_layer is not None else nn.Identity()
         self.proj = nn.Linear(all_head_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.tensor_parallel_size = 1
+        self.tensor_parallel_rank = 0
+        self.tensor_parallel_group = None
+        self.tensor_parallel_ranks: tuple[int, ...] | None = None
+
+    @property
+    def is_tensor_parallel(self) -> bool:
+        return self.tensor_parallel_size > 1
+
+    @property
+    def head_dim(self) -> int:
+        return self.proj.in_features // self.num_heads
+
+    @property
+    def local_num_heads(self) -> int:
+        return self.num_heads // self.tensor_parallel_size
+
+    @property
+    def local_channel_slice(self) -> slice:
+        start = self.tensor_parallel_rank * self.local_num_heads * self.head_dim
+        stop = start + self.local_num_heads * self.head_dim
+        return slice(start, stop)
+
+    def _qkv_indices_for_channel_slice(self, channel_slice: slice) -> torch.Tensor:
+        all_head_dim = self.proj.in_features
+        starts = (
+            channel_slice.start,
+            all_head_dim + channel_slice.start,
+            2 * all_head_dim + channel_slice.start,
+        )
+        pieces = [
+            torch.arange(start, start + (channel_slice.stop - channel_slice.start), device=self.qkv.weight.device)
+            for start in starts
+        ]
+        return torch.cat(pieces, dim=0)
+
+    def set_tensor_parallel(
+        self,
+        *,
+        process_group=None,
+        ranks: tuple[int, ...] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        world_size = int(world_size)
+        rank = int(rank)
+        if world_size <= 0:
+            raise ValueError(f"tensor parallel world_size must be positive, got {world_size}.")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"tensor parallel rank must be in [0, {world_size}), got {rank}.")
+        if self.num_heads % world_size != 0:
+            raise ValueError(
+                f"num_heads={self.num_heads} must be divisible by tensor_parallel_size={world_size}."
+            )
+        if not isinstance(self.norm, nn.Identity):
+            raise ValueError("attention tensor parallelism does not support scale_attn_inner/norm_layer yet.")
+        if self.attn_drop.p != 0.0 or self.proj_drop.p != 0.0:
+            raise ValueError("attention tensor parallelism requires attn_drop_rate=proj_drop_rate=0.0.")
+        self.tensor_parallel_group = process_group
+        self.tensor_parallel_ranks = ranks
+        self.tensor_parallel_rank = rank
+        self.tensor_parallel_size = world_size
+
+    @staticmethod
+    def _slice_rope(rope: Optional[RopeEmbedding], head_slice: slice) -> Optional[RopeEmbedding]:
+        if rope is None:
+            return None
+        sin, cos = rope
+        if sin.ndim >= 3 and sin.shape[0] >= head_slice.stop:
+            return sin[head_slice], cos[head_slice]
+        return rope
+
+    def _linear_qkv_tensor_parallel(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B, N, _ = x.shape
+        channel_slice = self.local_channel_slice
+        if self.qkv is not None:
+            indices = self._qkv_indices_for_channel_slice(channel_slice)
+            weight = self.qkv.weight.index_select(0, indices)
+            if self.q_bias is None:
+                bias = None
+            else:
+                qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias))
+                bias = qkv_bias.index_select(0, indices)
+            qkv = F.linear(x, weight=weight, bias=bias)
+            qkv = qkv.reshape(B, N, 3, self.local_num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+            return qkv.unbind(0)
+
+        q = F.linear(
+            x,
+            self.q_proj.weight[channel_slice],
+            self.q_proj.bias[channel_slice] if self.q_proj.bias is not None else None,
+        ).reshape(B, N, self.local_num_heads, self.head_dim).transpose(1, 2)
+        k = F.linear(
+            x,
+            self.k_proj.weight[channel_slice],
+            self.k_proj.bias[channel_slice] if self.k_proj.bias is not None else None,
+        ).reshape(B, N, self.local_num_heads, self.head_dim).transpose(1, 2)
+        v = F.linear(
+            x,
+            self.v_proj.weight[channel_slice],
+            self.v_proj.bias[channel_slice] if self.v_proj.bias is not None else None,
+        ).reshape(B, N, self.local_num_heads, self.head_dim).transpose(1, 2)
+        return q, k, v
+
+    def _project_tensor_parallel_output(self, x: torch.Tensor) -> torch.Tensor:
+        channel_slice = self.local_channel_slice
+        projected = F.linear(x, self.proj.weight[:, channel_slice], bias=None)
+        projected = _reduce_from_tensor_parallel_region(projected, self.tensor_parallel_group)
+        if self.proj.bias is not None:
+            projected = projected + self.proj.bias
+        return projected
+
+    def _broadcast_parameter_slice(self, tensor: torch.Tensor, slice_spec, source_rank: int) -> None:
+        if self.tensor_parallel_group is None or self.tensor_parallel_ranks is None:
+            return
+        view = tensor[slice_spec].contiguous()
+        dist.broadcast(view, src=source_rank, group=self.tensor_parallel_group)
+        tensor[slice_spec].copy_(view)
+
+    def _sync_optimizer_state_slice(self, optimizer_state: dict, parameter: nn.Parameter, slice_spec, source_rank: int) -> None:
+        state = optimizer_state.get(parameter)
+        if not state:
+            return
+        for value in state.values():
+            if torch.is_tensor(value) and value.shape == parameter.shape:
+                self._broadcast_parameter_slice(value, slice_spec, source_rank)
+
+    def sync_tensor_parallel_parameters(self, optimizer: torch.optim.Optimizer | None = None) -> None:
+        if not self.is_tensor_parallel or self.tensor_parallel_ranks is None:
+            return
+        optimizer_state = optimizer.state if optimizer is not None else {}
+        all_head_dim = self.proj.in_features
+        local_width = self.local_num_heads * self.head_dim
+        for owner_rank, source_rank in enumerate(self.tensor_parallel_ranks):
+            start = owner_rank * local_width
+            stop = start + local_width
+            channel_slice = slice(start, stop)
+            if self.qkv is not None:
+                qkv_indices = (
+                    list(range(start, stop))
+                    + list(range(all_head_dim + start, all_head_dim + stop))
+                    + list(range(2 * all_head_dim + start, 2 * all_head_dim + stop))
+                )
+                qkv_slice = torch.tensor(qkv_indices, device=self.qkv.weight.device, dtype=torch.long)
+                weight_view = self.qkv.weight.index_select(0, qkv_slice).contiguous()
+                dist.broadcast(weight_view, src=source_rank, group=self.tensor_parallel_group)
+                self.qkv.weight.data.index_copy_(0, qkv_slice, weight_view)
+                state = optimizer_state.get(self.qkv.weight)
+                if state:
+                    for value in state.values():
+                        if torch.is_tensor(value) and value.shape == self.qkv.weight.shape:
+                            state_view = value.index_select(0, qkv_slice).contiguous()
+                            dist.broadcast(state_view, src=source_rank, group=self.tensor_parallel_group)
+                            value.index_copy_(0, qkv_slice, state_view)
+                for bias_parameter in (self.q_bias, self.v_bias):
+                    if bias_parameter is not None:
+                        self._broadcast_parameter_slice(bias_parameter.data, channel_slice, source_rank)
+                        self._sync_optimizer_state_slice(optimizer_state, bias_parameter, channel_slice, source_rank)
+            else:
+                for projection in (self.q_proj, self.k_proj, self.v_proj):
+                    self._broadcast_parameter_slice(projection.weight.data, (channel_slice, slice(None)), source_rank)
+                    self._sync_optimizer_state_slice(
+                        optimizer_state,
+                        projection.weight,
+                        (channel_slice, slice(None)),
+                        source_rank,
+                    )
+                    if projection.bias is not None:
+                        self._broadcast_parameter_slice(projection.bias.data, channel_slice, source_rank)
+                        self._sync_optimizer_state_slice(optimizer_state, projection.bias, channel_slice, source_rank)
+
+            self._broadcast_parameter_slice(self.proj.weight.data, (slice(None), channel_slice), source_rank)
+            self._sync_optimizer_state_slice(
+                optimizer_state,
+                self.proj.weight,
+                (slice(None), channel_slice),
+                source_rank,
+            )
     
     def forward(
             self,
@@ -102,7 +317,15 @@ class EvaAttention(nn.Module):
     ):
         B, N, C = x.shape
         
-        if self.qkv is not None:
+        if self.is_tensor_parallel:
+            x = _copy_to_tensor_parallel_region(x, self.tensor_parallel_group)
+            q, k, v = self._linear_qkv_tensor_parallel(x)
+            local_head_slice = slice(
+                self.tensor_parallel_rank * self.local_num_heads,
+                (self.tensor_parallel_rank + 1) * self.local_num_heads,
+            )
+            rope = self._slice_rope(rope, local_head_slice)
+        elif self.qkv is not None:
             if self.q_bias is None:
                 qkv = self.qkv(x)
             else:
@@ -142,9 +365,13 @@ class EvaAttention(nn.Module):
             attn = self.attn_drop(attn)
             x = attn @ v
         
-        x = x.transpose(1, 2).reshape(B, N, C)
+        output_width = self.local_num_heads * self.head_dim if self.is_tensor_parallel else C
+        x = x.transpose(1, 2).reshape(B, N, output_width)
         x = self.norm(x)
-        x = self.proj(x)
+        if self.is_tensor_parallel:
+            x = self._project_tensor_parallel_output(x)
+        else:
+            x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
@@ -277,6 +504,24 @@ class EvaBlock(nn.Module):
             x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
             x = x + self.drop_path2(self.gamma_2 * self.mlp(self.norm2(x)))
         return x
+
+    def set_tensor_parallel(
+        self,
+        *,
+        process_group=None,
+        ranks: tuple[int, ...] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.attn.set_tensor_parallel(
+            process_group=process_group,
+            ranks=ranks,
+            rank=rank,
+            world_size=world_size,
+        )
+
+    def sync_tensor_parallel_parameters(self, optimizer: torch.optim.Optimizer | None = None) -> None:
+        self.attn.sync_tensor_parallel_parameters(optimizer=optimizer)
 
 
 class Eva(nn.Module):
@@ -772,7 +1017,14 @@ class Eva(nn.Module):
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                x = checkpoint(
+                    blk,
+                    x,
+                    rope=rot_pos_embed,
+                    rope_shape=rope_shape,
+                    rope_coords=rope_coords,
+                    use_reentrant=False,
+                )
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         x = self.norm(x)
@@ -787,6 +1039,30 @@ class Eva(nn.Module):
     
     def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
         return self.forward_features_list(x, masks, view_kind=view_kind)
+
+    def set_tensor_parallel(
+            self,
+            *,
+            process_group=None,
+            ranks: tuple[int, ...] | None = None,
+            rank: int = 0,
+            world_size: int = 1,
+    ) -> None:
+        for block in self.blocks:
+            set_tensor_parallel = getattr(block, "set_tensor_parallel", None)
+            if callable(set_tensor_parallel):
+                set_tensor_parallel(
+                    process_group=process_group,
+                    ranks=ranks,
+                    rank=rank,
+                    world_size=world_size,
+                )
+
+    def sync_tensor_parallel_parameters(self, optimizer: torch.optim.Optimizer | None = None) -> None:
+        for block in self.blocks:
+            sync_tensor_parallel_parameters = getattr(block, "sync_tensor_parallel_parameters", None)
+            if callable(sync_tensor_parallel_parameters):
+                sync_tensor_parallel_parameters(optimizer=optimizer)
     
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
@@ -888,6 +1164,26 @@ class BlockChunk(nn.ModuleList):
             x = blk(x, rope=rope, attn_mask=attn_mask, rope_shape=rope_shape, rope_coords=rope_coords)
         return x
 
+    def set_tensor_parallel(
+            self,
+            *,
+            process_group=None,
+            ranks: tuple[int, ...] | None = None,
+            rank: int = 0,
+            world_size: int = 1,
+    ) -> None:
+        for block in self:
+            block.set_tensor_parallel(
+                process_group=process_group,
+                ranks=ranks,
+                rank=rank,
+                world_size=world_size,
+            )
+
+    def sync_tensor_parallel_parameters(self, optimizer: torch.optim.Optimizer | None = None) -> None:
+        for block in self:
+            block.sync_tensor_parallel_parameters(optimizer=optimizer)
+
 
 class EvaWithChunking(Eva):
     def __init__(self, *args, block_chunks: int = 1, **kwargs):
@@ -915,13 +1211,27 @@ class EvaWithChunking(Eva):
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(
+                        chunk,
+                        x,
+                        rope=rot_pos_embed,
+                        rope_shape=rope_shape,
+                        rope_coords=rope_coords,
+                        use_reentrant=False,
+                    )
                 else:
                     x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(
+                        blk,
+                        x,
+                        rope=rot_pos_embed,
+                        rope_shape=rope_shape,
+                        rope_coords=rope_coords,
+                        use_reentrant=False,
+                    )
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         

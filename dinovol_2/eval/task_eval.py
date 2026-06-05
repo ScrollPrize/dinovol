@@ -472,12 +472,14 @@ class TaskEvalRunner:
         output_dir: Path,
         device: torch.device,
         use_amp: bool,
+        amp_dtype: torch.dtype | None = None,
     ) -> None:
         self.config = dict(config)
         self.output_dir = Path(output_dir) / "task_eval"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
         self.use_amp = bool(use_amp and device.type == "cuda")
+        self.amp_dtype = amp_dtype
         self.tasks = resolve_eval_tasks(self.config.get("eval_task", "both"))
         self.train_iters = int(self.config.get("eval_task_train_iters", 500))
         if self.train_iters < 0:
@@ -717,7 +719,7 @@ class TaskEvalRunner:
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+        scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.amp_dtype == torch.float16)
 
         train_loss_total = 0.0
         ddp_model.train()
@@ -735,7 +737,7 @@ class TaskEvalRunner:
                 target = target.unsqueeze(0).to(self.device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
                     logits = ddp_model(image)
                     loss = self._task_loss(task_name, logits, target)
                 scaler.scale(loss).backward()
@@ -752,7 +754,7 @@ class TaskEvalRunner:
         val_names: list[str] = []
         image_path: Path | None = None
         validation_image_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             for val_image, val_target, val_name in validation_crops:
                 val_names.append(val_name)
                 val_batch = val_image.unsqueeze(0).to(self.device, non_blocking=True)

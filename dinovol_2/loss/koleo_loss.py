@@ -6,11 +6,10 @@
 import logging
 
 import torch
+import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn_functional
 import torch.nn as nn
 import torch.nn.functional as F
-
-# import torch.distributed as dist
-
 
 logger = logging.getLogger("dinov2")
 
@@ -18,9 +17,20 @@ logger = logging.getLogger("dinov2")
 class KoLeoLoss(nn.Module):
     """Kozachenko-Leonenko entropic loss regularizer from Sablayrolles et al. - 2018 - Spreading vectors for similarity search"""
 
-    def __init__(self):
+    def __init__(self, *, distributed: bool = False, process_group=None):
         super().__init__()
         self.pdist = nn.PairwiseDistance(2, eps=1e-8)
+        self.distributed = bool(distributed)
+        self.process_group = process_group
+
+    def set_process_group(self, process_group) -> None:
+        self.process_group = process_group
+
+    def _gather_if_needed(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.distributed or not dist.is_available() or not dist.is_initialized():
+            return x
+        gathered = dist_nn_functional.all_gather(x, group=self.process_group)
+        return torch.cat(tuple(gathered), dim=0)
 
     def pairwise_NNs_inner(self, x):
         """
@@ -41,6 +51,9 @@ class KoLeoLoss(nn.Module):
             student_output (BxD): backbone output of student
         """
         with torch.amp.autocast(device_type=student_output.device.type, enabled=False):
+            student_output = self._gather_if_needed(student_output)
+            if student_output.shape[0] < 2:
+                return student_output.new_zeros(())
             student_output = F.normalize(student_output, eps=eps, p=2, dim=-1)
             I = self.pairwise_NNs_inner(student_output)  # noqa: E741
             distances = self.pdist(student_output, student_output[I])  # BxD, BxD -> B

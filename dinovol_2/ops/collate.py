@@ -23,6 +23,7 @@ def collate_dino_ibot_batch(
     mask_sample_probability: float,
     n_tokens: int,
     mask_generator: MaskingGenerator3d,
+    max_masked_patches: int | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> dict[str, Any]:
     n_global_views = len(samples[0]["global_views"])
@@ -66,6 +67,17 @@ def collate_dino_ibot_batch(
 
     collated_masks = torch.stack(masks_list).flatten(1)
     mask_indices_list = collated_masks.flatten().nonzero().flatten()
+    if max_masked_patches is not None:
+        max_masked_patches = int(max_masked_patches)
+        if max_masked_patches <= 0:
+            raise ValueError(f"max_masked_patches must be positive when set, got {max_masked_patches}")
+        if mask_indices_list.numel() > max_masked_patches:
+            selected = torch.randperm(mask_indices_list.numel())[:max_masked_patches]
+            mask_indices_list = mask_indices_list.index_select(0, selected).sort().values
+            capped_masks = torch.zeros_like(collated_masks.flatten())
+            capped_masks[mask_indices_list] = True
+            collated_masks = capped_masks.reshape_as(collated_masks)
+            upperbound = min(int(upperbound), int(max_masked_patches))
     tokens_per_sample = collated_masks.shape[1]
     inverse_mask_counts = 1.0 / collated_masks.sum(-1).clamp(min=1.0)
     masked_sample_indices = torch.div(mask_indices_list, tokens_per_sample, rounding_mode="floor")
@@ -100,5 +112,6 @@ def build_dino_ibot_collate_fn(config: Mapping[str, Any]) -> partial:
         mask_sample_probability=float(config.get("mask_sample_probability", 0.5)),
         n_tokens=n_tokens,
         mask_generator=mask_generator,
+        max_masked_patches=config.get("max_masked_patches"),
         dtype=config.get("dtype", torch.float32),
     )

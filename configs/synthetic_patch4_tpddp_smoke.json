@@ -1,0 +1,69 @@
+{
+  "output_dir": "${OUTPUT_DIR}",
+  "device": "cuda",
+  "resume": false,
+  "auto_resume": false,
+  "wandb_project": null,
+  "lr": 1e-4,
+  "min_lr": 1e-6,
+  "weight_decay": 0.04,
+  "weight_decay_end": 0.2,
+  "warmup_steps": 0,
+  "warmup_teacher_temp_steps": 0,
+  "clip_grad": 3.0,
+  "max_iterations": 2,
+  "batch_size": 1,
+  "use_amp": true,
+  "amp_dtype": "bf16",
+  "centering": "sinkhorn_knopp",
+  "num_local_crops": 2,
+  "dataloader-workers": 0,
+  "distributed_timeout_seconds": 1800,
+  "parallelism": {
+    "strategy": "tp_ddp",
+    "tensor_parallel_size": 4
+  },
+  "koleo": {
+    "distributed": true
+  },
+  "ibot": {
+    "max_masked_patches_per_rank": 2048,
+    "projection_chunk_size": 512,
+    "loss_chunk_size": 512
+  },
+  "model": {
+    "model_type": "v2",
+    "input_channels": 1,
+    "embedding_type": "default",
+    "global_crops_size": [64, 64, 64],
+    "local_crops_size": [32, 32, 32],
+    "patch_size": [4, 4, 4],
+    "embed_dim": 96,
+    "depth": 2,
+    "num_heads": 8,
+    "num_reg_tokens": 2,
+    "dino_out_dim": 128,
+    "ibot_out_dim": 128,
+    "dino_head_hidden_dim": 128,
+    "dino_head_bottleneck_dim": 96,
+    "ibot_head_hidden_dim": 128,
+    "ibot_head_bottleneck_dim": 96,
+    "grad_checkpointing": true
+  },
+  "dataset": {
+    "epoch_length": 32,
+    "vol_trim_pct": 1.0,
+    "global_crop_size": [64, 64, 64],
+    "local_crop_size": [32, 32, 32],
+    "global_crop_scale": [0.5, 1.0],
+    "local_crop_scale": [0.5, 1.0],
+    "num_local_crops": 2,
+    "source_sampling_size": [80, 80, 80],
+    "datasets": [
+      {
+        "volume_path": "${SYNTHETIC_ZARR}",
+        "volume_scale": 0
+      }
+    ]
+  }
+}

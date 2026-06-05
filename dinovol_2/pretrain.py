@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from datetime import timedelta
 import json
 from pathlib import Path
 import random
@@ -18,11 +19,16 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from PIL import Image
 
+from dinovol_2.config import load_config
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 
 from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
-from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
+from dinovol_2.ops.distributed_utils import (
+    build_distributed_sampler,
+    build_parallel_process_groups,
+    resolve_distributed_config,
+)
 from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
 from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
@@ -122,6 +128,15 @@ class DinoIBOTPretrainer:
         self.rank = int(distributed_config["rank"])
         self.local_rank = int(distributed_config["local_rank"])
         self.world_size = int(distributed_config["world_size"])
+        self.parallelism_strategy = str(distributed_config.get("strategy", "ddp"))
+        self.tensor_parallel_size = int(distributed_config.get("tensor_parallel_size", 1))
+        self.tensor_parallel_rank = int(distributed_config.get("tensor_parallel_rank", 0))
+        self.data_parallel_world_size = int(distributed_config.get("data_parallel_world_size", self.world_size))
+        self.data_parallel_rank = int(distributed_config.get("data_parallel_rank", self.rank))
+        self.tensor_parallel_group = None
+        self.tensor_parallel_ranks: tuple[int, ...] = (self.rank,)
+        self.data_parallel_group = None
+        self.data_parallel_ranks: tuple[int, ...] = tuple(range(self.world_size)) if self.is_distributed else (0,)
 
         configured_device_name = self.config.get("device")
         configured_device = torch.device(configured_device_name) if configured_device_name is not None else None
@@ -146,11 +161,41 @@ class DinoIBOTPretrainer:
                 )
             if not dist.is_initialized():
                 backend = "nccl" if self.device.type == "cuda" else "gloo"
-                dist.init_process_group(backend=backend, init_method="env://")
+                timeout_seconds = int(self.config.get("distributed_timeout_seconds", 1800))
+                timeout = timedelta(seconds=timeout_seconds if timeout_seconds > 0 else 1800)
+                init_kwargs: dict[str, Any] = {
+                    "backend": backend,
+                    "init_method": "env://",
+                    "timeout": timeout,
+                }
+                if backend == "nccl":
+                    init_kwargs["device_id"] = self.device
+                dist.init_process_group(**init_kwargs)
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
+            parallel_groups = build_parallel_process_groups(
+                is_distributed=self.is_distributed,
+                world_size=self.world_size,
+                rank=self.rank,
+                tensor_parallel_size=self.tensor_parallel_size,
+            )
+            self.tensor_parallel_group = parallel_groups["tensor_parallel_group"]
+            self.tensor_parallel_ranks = tuple(int(rank) for rank in parallel_groups["tensor_parallel_ranks"])
+            self.data_parallel_group = parallel_groups["data_parallel_group"]
+            self.data_parallel_ranks = tuple(int(rank) for rank in parallel_groups["data_parallel_ranks"])
+            self.tensor_parallel_rank = self.tensor_parallel_ranks.index(self.rank)
+            self.data_parallel_rank = self.data_parallel_ranks.index(self.rank)
+            self.data_parallel_world_size = len(self.data_parallel_ranks)
 
-        self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda"))
+        if self.is_distributed and self.is_main_process:
+            print(
+                "distributed="
+                f"{self.is_distributed} strategy={self.parallelism_strategy} world={self.world_size} "
+                f"dp={self.data_parallel_world_size} tp={self.tensor_parallel_size} device={self.device}"
+            )
+
+        self.amp_dtype = self._resolve_amp_dtype(self.config.get("amp_dtype", "auto"))
+        self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda")) and self.amp_dtype is not None
         self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
         self.total_steps = self.max_iterations
         self.base_lr = float(self.config.get("lr", 1e-4))
@@ -161,6 +206,13 @@ class DinoIBOTPretrainer:
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
         self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
         self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 0.2))
+        self.ibot_config = dict(self.config.get("ibot") or {})
+        ibot_projection_chunk_size = self.ibot_config.get(
+            "projection_chunk_size",
+            self.config.get("ibot_projection_chunk_size", self.config.get("masked_projection_chunk_size")),
+        )
+        if ibot_projection_chunk_size is not None:
+            self.model_config["ibot_projection_chunk_size"] = int(ibot_projection_chunk_size)
         
         warmup_ratio = float(self.config.get("warmup_ratio", 0.1))
         default_warmup_steps = 0
@@ -170,6 +222,13 @@ class DinoIBOTPretrainer:
         self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()
 
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
+        if self.tensor_parallel_size > 1:
+            self.model.set_tensor_parallel(
+                process_group=self.tensor_parallel_group,
+                ranks=self.tensor_parallel_ranks,
+                rank=self.tensor_parallel_rank,
+                world_size=self.tensor_parallel_size,
+            )
         self._configure_deeper_embed_overscan()
         self.optimizer = self._build_optimizer()
         if self.is_distributed:
@@ -184,20 +243,31 @@ class DinoIBOTPretrainer:
                         "output_device": self.device.index,
                     }
                 )
+            if self.data_parallel_group is not None:
+                ddp_kwargs["process_group"] = self.data_parallel_group
             self.model = DDP(self.model, **ddp_kwargs)
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self.use_amp and self.device.type == "cuda" and self.amp_dtype == torch.float16,
+        )
         
         dino_out_dim = int(self.model_config.get("dino_out_dim", 131072))
         ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
         self.dino_loss = DINOLoss(dino_out_dim).to(self.device)
-        masked_loss_chunk_size = self.config.get("ibot_masked_loss_chunk_size")
+        masked_loss_chunk_size = self.ibot_config.get("loss_chunk_size", self.config.get("ibot_masked_loss_chunk_size"))
         if masked_loss_chunk_size is not None:
             masked_loss_chunk_size = int(masked_loss_chunk_size)
         self.ibot_patch_loss = iBOTPatchLoss(
             ibot_out_dim,
             masked_loss_chunk_size=masked_loss_chunk_size,
+            process_group=self.data_parallel_group,
         ).to(self.device)
-        self.koleo_loss = KoLeoLoss().to(self.device)
+        self.dino_loss.set_process_group(self.data_parallel_group)
+        self.koleo_config = dict(self.config.get("koleo") or {})
+        self.koleo_loss = KoLeoLoss(
+            distributed=bool(self.koleo_config.get("distributed", self.is_distributed)),
+            process_group=self.data_parallel_group,
+        ).to(self.device)
         self.gram_config = dict(self.config.get("gram") or {})
         self.do_gram = bool(self.gram_config.get("enabled", False))
         self.gram_loss = (
@@ -283,6 +353,7 @@ class DinoIBOTPretrainer:
                 output_dir=self.output_dir,
                 device=self.device,
                 use_amp=self.use_amp,
+                amp_dtype=self.amp_dtype,
             )
             if self.task_eval_every > 0
             else None
@@ -324,6 +395,26 @@ class DinoIBOTPretrainer:
         self.gram_teacher_backbone.load_state_dict(self.model_module.teacher.backbone.state_dict(), strict=True)
         self.gram_teacher_backbone.requires_grad_(False)
         self.gram_teacher_backbone.eval()
+
+    def _resolve_amp_dtype(self, value: Any) -> torch.dtype | None:
+        if value is None:
+            return torch.float16 if self.device.type == "cuda" else None
+        if isinstance(value, torch.dtype):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {"", "off", "false", "none", "no"}:
+            return None
+        if normalized == "auto":
+            if self.device.type != "cuda":
+                return None
+            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            return torch.float16
+        if normalized in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if normalized in {"fp16", "float16", "half"}:
+            return torch.float16
+        raise ValueError("amp_dtype must be one of auto, bf16, fp16, off, false, none, or a torch dtype.")
 
     def _maybe_refresh_gram_teacher(self, step: int) -> None:
         if self.gram_teacher_backbone is None:
@@ -639,6 +730,7 @@ class DinoIBOTPretrainer:
                 "patch_size": self.model_config.get("patch_size", (16, 16, 16)),
                 "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
                 "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
+                "max_masked_patches": self.ibot_config.get("max_masked_patches_per_rank"),
                 "dtype": torch.float32,
             }
         )
@@ -646,8 +738,8 @@ class DinoIBOTPretrainer:
         sampler = build_distributed_sampler(
             dataset,
             is_distributed=self.is_distributed,
-            rank=self.rank,
-            world_size=self.world_size,
+            rank=self.data_parallel_rank,
+            world_size=self.data_parallel_world_size,
             shuffle=shuffle,
         )
         return DataLoader(
@@ -832,6 +924,7 @@ class DinoIBOTPretrainer:
                     "patch_size": self.model_config.get("patch_size", (16, 16, 16)),
                     "mask_ratio_min_max": _as_float_pair(self.config.get("mask_ratio_min_max"), (0.1, 0.5)),
                     "mask_sample_probability": float(self.config.get("mask_sample_probability", 0.5)),
+                    "max_masked_patches": self.ibot_config.get("max_masked_patches_per_rank"),
                     "dtype": torch.float32,
                 }
             )
@@ -1081,7 +1174,7 @@ class DinoIBOTPretrainer:
         n_masked = int(batch["n_masked_patches"].item())
 
         self.model.eval()
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             model_outputs = self._forward_model(
                 global_crops=global_crops,
                 local_crops=local_crops if n_local_views else None,
@@ -1406,7 +1499,7 @@ class DinoIBOTPretrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             model_outputs = self._forward_model(
                 global_crops=global_crops,
                 local_crops=local_crops if n_local_views else None,
@@ -1487,6 +1580,8 @@ class DinoIBOTPretrainer:
         clip_grad_norm_(self.model_module.student.parameters(), self.clip_grad)
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        if self.tensor_parallel_size > 1:
+            self.model_module.sync_tensor_parallel_parameters(optimizer=self.optimizer)
         self.model_module.update_teacher(teacher_momentum)
         self._maybe_refresh_gram_teacher(step)
 
@@ -1647,7 +1742,7 @@ class DinoIBOTPretrainer:
     
     def save_monitor_image(self, monitor_batch: Mapping[str, Any], step: int, metrics: Mapping[str, float]) -> Path:
         self.model.eval()
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             global_crops = monitor_batch["collated_global_crops"].to(self.device, non_blocking=True)
             student_outputs = self.model(
                 student_input=global_crops,
@@ -1703,7 +1798,7 @@ class DinoIBOTPretrainer:
         n_local_views = int(batch["n_local_views"])
         n_masked = int(batch["n_masked_patches"].item())
 
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
             model_outputs = self._forward_model(
                 global_crops=global_crops,
                 local_crops=local_crops if n_local_views else None,
@@ -1913,8 +2008,7 @@ def main() -> None:
     parser.add_argument("--ddp", action="store_true")
     args = parser.parse_args()
     
-    with open(args.config, 'r') as f:
-        config = json.load(f)
+    config = load_config(args.config)
     
     if args.resume_from is not None:
         config["resume_from"] = args.resume_from
