@@ -9,6 +9,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 RDZV_ID="${RDZV_ID:-dinovol-pretrain}"
 RDZV_BACKEND="${RDZV_BACKEND:-c10d}"
+RDZV_CONF="${RDZV_CONF:-}"
 MODULE="${MODULE:-dinovol_2.pretrain}"
 CONFIG_ARGS=()
 if [[ -n "${CONFIG:-}" ]]; then
@@ -56,6 +57,9 @@ if [[ "${RDZV_BACKEND}" == "static" ]]; then
   TORCHRUN_ARGS+=(--master-addr="${MASTER_ADDR}" --master-port="${MASTER_PORT}")
 else
   TORCHRUN_ARGS+=(--rdzv-backend="${RDZV_BACKEND}" --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" --rdzv-id="${RDZV_ID}")
+  if [[ -n "${RDZV_CONF}" ]]; then
+    TORCHRUN_ARGS+=(--rdzv-conf="${RDZV_CONF}")
+  fi
 fi
 if [[ -n "${TORCHRUN_NUMA_BINDING:-}" ]]; then
   TORCHRUN_ARGS+=(--numa-binding="${TORCHRUN_NUMA_BINDING}")
