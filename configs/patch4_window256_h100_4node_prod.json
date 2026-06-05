@@ -23,6 +23,12 @@
   "val_every_n": 500,
   "save_every_n": 2500,
   "log_every": 20,
+  "cluster_metrics": {
+    "enabled": true,
+    "every_n": 20,
+    "query_nvidia_smi": true,
+    "log_per_rank": true
+  },
   "batch_size": 1,
   "gradient_accumulation_steps": 1,
   "use_amp": true,

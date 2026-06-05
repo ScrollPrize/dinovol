@@ -214,6 +214,46 @@ class ParallelismSupportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "compile.mode"):
             DinoIBOTPretrainer._resolve_compile_config({"mode": "fastest"})
 
+    def test_cluster_gpu_metrics_config_and_formatting(self) -> None:
+        trainer = object.__new__(DinoIBOTPretrainer)
+        trainer.log_every = 20
+
+        default = trainer._resolve_cluster_metrics_config(None)
+        self.assertFalse(default["enabled"])
+        self.assertEqual(default["every_n"], 20)
+        self.assertTrue(default["query_nvidia_smi"])
+        self.assertTrue(default["log_per_rank"])
+
+        enabled = trainer._resolve_cluster_metrics_config(
+            {
+                "enabled": True,
+                "every_n": 5,
+                "query_nvidia_smi": False,
+                "log_per_rank": False,
+            }
+        )
+        self.assertTrue(enabled["enabled"])
+        self.assertEqual(enabled["every_n"], 5)
+        self.assertFalse(enabled["query_nvidia_smi"])
+        self.assertFalse(enabled["log_per_rank"])
+
+        with self.assertRaisesRegex(ValueError, "cluster_metrics.every_n"):
+            trainer._resolve_cluster_metrics_config({"enabled": True, "every_n": 0})
+
+        rows = torch.tensor(
+            [
+                [0, 0, 0, 0, 0, 0, 1.0, 2.0, 3.0, 4.0, 10.0, 80.0, 50.0, 700.0, 41.0],
+                [1, 1, 0, 1, 0, 1, 2.0, 4.0, 5.0, 6.0, 20.0, 80.0, 75.0, 650.0, 43.0],
+            ],
+            dtype=torch.float64,
+        )
+        payload = DinoIBOTPretrainer._format_cluster_gpu_metrics(rows, log_per_rank=True)
+        self.assertEqual(payload["cluster/gpu_utilization_pct/max"], 75.0)
+        self.assertEqual(payload["cluster/gpu_power_w/sum"], 1350.0)
+        self.assertEqual(payload["cluster/torch_memory_reserved_gib/mean"], 3.0)
+        self.assertEqual(payload["cluster/rank_001/local_rank"], 1.0)
+        self.assertEqual(payload["cluster/rank_001/context_parallel_rank"], 1.0)
+
     def test_compile_blocks_and_heads_preserves_state_dict_keys(self) -> None:
         model = DinoVitStudentTeacher(_tiny_compile_model_config()).eval()
         trainer = object.__new__(DinoIBOTPretrainer)

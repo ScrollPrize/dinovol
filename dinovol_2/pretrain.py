@@ -5,8 +5,10 @@ from contextlib import nullcontext
 from copy import deepcopy
 from datetime import timedelta
 import json
+import os
 from pathlib import Path
 import random
+import subprocess
 import time
 from typing import Any, Iterator, Mapping
 
@@ -49,6 +51,34 @@ from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_c
 
 _COMPILE_SCOPES = {"blocks", "heads", "blocks_and_heads"}
 _COMPILE_MODES = {"default", "max-autotune-no-cudagraphs", "max-autotune", "reduce-overhead"}
+_CLUSTER_GPU_METRIC_FIELDS = (
+    "rank",
+    "local_rank",
+    "node_rank",
+    "data_parallel_rank",
+    "tensor_parallel_rank",
+    "context_parallel_rank",
+    "torch_memory_allocated_gib",
+    "torch_memory_reserved_gib",
+    "torch_max_memory_allocated_gib",
+    "torch_max_memory_reserved_gib",
+    "gpu_memory_used_gib",
+    "gpu_memory_total_gib",
+    "gpu_utilization_pct",
+    "gpu_power_w",
+    "gpu_temperature_c",
+)
+_CLUSTER_GPU_SUMMARY_FIELDS = (
+    "torch_memory_allocated_gib",
+    "torch_memory_reserved_gib",
+    "torch_max_memory_allocated_gib",
+    "torch_max_memory_reserved_gib",
+    "gpu_memory_used_gib",
+    "gpu_memory_total_gib",
+    "gpu_utilization_pct",
+    "gpu_power_w",
+    "gpu_temperature_c",
+)
 
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -393,6 +423,7 @@ class DinoIBOTPretrainer:
         ) = self._build_schedulers()
         
         self.log_every = int(self.config.get("log_every", 20))
+        self.cluster_metrics_config = self._resolve_cluster_metrics_config(self.config.get("cluster_metrics"))
         self.val_every_n = int(self.config.get("val_every_n", 0))
         self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
         self.monitor_batch_size = max(5, int(self.config.get("monitor_batch_size", 5)))
@@ -1202,6 +1233,144 @@ class DinoIBOTPretrainer:
         values /= self.world_size
         return {key: float(values[index].item()) for index, key in enumerate(keys)}
 
+    def _resolve_cluster_metrics_config(self, value: Any) -> dict[str, Any]:
+        if value is None:
+            value = {}
+        if isinstance(value, bool):
+            value = {"enabled": value}
+        if not isinstance(value, Mapping):
+            raise ValueError("cluster_metrics must be a mapping, boolean, or null.")
+        every_n = int(value.get("every_n", self.log_every))
+        if every_n <= 0:
+            raise ValueError(f"cluster_metrics.every_n must be positive, got {every_n}.")
+        return {
+            "enabled": bool(value.get("enabled", False)),
+            "every_n": every_n,
+            "query_nvidia_smi": bool(value.get("query_nvidia_smi", True)),
+            "log_per_rank": bool(value.get("log_per_rank", True)),
+        }
+
+    def _query_nvidia_smi_for_current_gpu(self) -> dict[str, float]:
+        metrics = {
+            "gpu_memory_used_gib": float("nan"),
+            "gpu_memory_total_gib": float("nan"),
+            "gpu_utilization_pct": float("nan"),
+            "gpu_power_w": float("nan"),
+            "gpu_temperature_c": float("nan"),
+        }
+        if self.device.type != "cuda" or not bool(self.cluster_metrics_config["query_nvidia_smi"]):
+            return metrics
+        try:
+            completed = subprocess.run(
+                [
+                    "nvidia-smi",
+                    f"--id={torch.cuda.current_device()}",
+                    "--query-gpu=memory.used,memory.total,utilization.gpu,power.draw,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError, RuntimeError):
+            return metrics
+        line = completed.stdout.strip().splitlines()[0] if completed.stdout.strip() else ""
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 5:
+            return metrics
+        try:
+            memory_used_mib, memory_total_mib, utilization_pct, power_w, temperature_c = (float(part) for part in parts)
+        except ValueError:
+            return metrics
+        metrics.update(
+            {
+                "gpu_memory_used_gib": memory_used_mib / 1024.0,
+                "gpu_memory_total_gib": memory_total_mib / 1024.0,
+                "gpu_utilization_pct": utilization_pct,
+                "gpu_power_w": power_w,
+                "gpu_temperature_c": temperature_c,
+            }
+        )
+        return metrics
+
+    def _local_cluster_gpu_metric_tensor(self) -> torch.Tensor:
+        gib = 1024.0 ** 3
+        if self.device.type == "cuda":
+            torch_metrics = {
+                "torch_memory_allocated_gib": torch.cuda.memory_allocated(self.device) / gib,
+                "torch_memory_reserved_gib": torch.cuda.memory_reserved(self.device) / gib,
+                "torch_max_memory_allocated_gib": torch.cuda.max_memory_allocated(self.device) / gib,
+                "torch_max_memory_reserved_gib": torch.cuda.max_memory_reserved(self.device) / gib,
+            }
+        else:
+            torch_metrics = {
+                "torch_memory_allocated_gib": float("nan"),
+                "torch_memory_reserved_gib": float("nan"),
+                "torch_max_memory_allocated_gib": float("nan"),
+                "torch_max_memory_reserved_gib": float("nan"),
+            }
+        node_rank = int(os.environ.get("GROUP_RANK", os.environ.get("NODE_RANK", -1)))
+        values = {
+            "rank": float(self.rank),
+            "local_rank": float(self.local_rank),
+            "node_rank": float(node_rank),
+            "data_parallel_rank": float(self.data_parallel_rank),
+            "tensor_parallel_rank": float(self.tensor_parallel_rank),
+            "context_parallel_rank": float(self.context_parallel_rank),
+            **torch_metrics,
+            **self._query_nvidia_smi_for_current_gpu(),
+        }
+        return torch.tensor(
+            [float(values[field]) for field in _CLUSTER_GPU_METRIC_FIELDS],
+            device=self.device,
+            dtype=torch.float64,
+        )
+
+    @staticmethod
+    def _format_cluster_gpu_metrics(rows: torch.Tensor, *, log_per_rank: bool = True) -> dict[str, float]:
+        if rows.ndim == 1:
+            rows = rows.unsqueeze(0)
+        rows_cpu = rows.detach().cpu().to(torch.float64)
+        field_to_index = {field: index for index, field in enumerate(_CLUSTER_GPU_METRIC_FIELDS)}
+        payload: dict[str, float] = {}
+        for field in _CLUSTER_GPU_SUMMARY_FIELDS:
+            values = rows_cpu[:, field_to_index[field]]
+            finite = values[torch.isfinite(values)]
+            if finite.numel() == 0:
+                continue
+            payload[f"cluster/{field}/mean"] = float(finite.mean().item())
+            payload[f"cluster/{field}/max"] = float(finite.max().item())
+            payload[f"cluster/{field}/min"] = float(finite.min().item())
+            if field == "gpu_power_w":
+                payload[f"cluster/{field}/sum"] = float(finite.sum().item())
+        if log_per_rank:
+            for row in rows_cpu:
+                rank = int(row[field_to_index["rank"]].item())
+                prefix = f"cluster/rank_{rank:03d}"
+                for field in _CLUSTER_GPU_METRIC_FIELDS:
+                    value = float(row[field_to_index[field]].item())
+                    if np.isfinite(value):
+                        payload[f"{prefix}/{field}"] = value
+        return payload
+
+    def _collect_cluster_gpu_metrics(self) -> dict[str, float]:
+        if not bool(self.cluster_metrics_config["enabled"]):
+            return {}
+        local = self._local_cluster_gpu_metric_tensor()
+        if self.is_distributed:
+            gathered = [torch.empty_like(local) for _ in range(self.world_size)]
+            dist.all_gather(gathered, local)
+            rows = torch.stack(gathered)
+        else:
+            rows = local.unsqueeze(0)
+        if not self.is_main_process:
+            return {}
+        return self._format_cluster_gpu_metrics(
+            rows,
+            log_per_rank=bool(self.cluster_metrics_config["log_per_rank"]),
+        )
+
     def _initialize_wandb(self) -> None:
         if self._wandb_enabled() or not self.is_main_process or not self.wandb_project:
             return
@@ -1240,6 +1409,7 @@ class DinoIBOTPretrainer:
         self._wandb.define_metric("train/*", step_metric="trainer/step")
         self._wandb.define_metric("val/*", step_metric="trainer/step")
         self._wandb.define_metric("task_eval/*", step_metric="trainer/step")
+        self._wandb.define_metric("cluster/*", step_metric="trainer/step")
         self.wandb_run_id = self._current_wandb_run_id()
         if self.wandb_run_id is not None:
             self.config["wandb_run_id"] = self.wandb_run_id
@@ -2712,8 +2882,14 @@ class DinoIBOTPretrainer:
                         gram_loss=f"{metrics['gram_loss']:.4f}",
                     )
                     progress.update(1)
+                cluster_metrics = {}
+                if (
+                    bool(self.cluster_metrics_config["enabled"])
+                    and step % int(self.cluster_metrics_config["every_n"]) == 0
+                ):
+                    cluster_metrics = self._collect_cluster_gpu_metrics()
                 if self.is_main_process:
-                    self._log_wandb_metrics("train", metrics, step=step)
+                    self._log_wandb_metrics("train", metrics, step=step, extra=cluster_metrics)
                 
                 if self.is_main_process and step % self.log_every == 0:
                     print(
