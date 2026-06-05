@@ -12,7 +12,9 @@ import torch.multiprocessing as mp
 
 from dinovol_2.config import load_config
 from dinovol_2.loss import KoLeoLoss, iBOTPatchLoss
-from dinovol_2.model.dinov2_eva import EvaAttention
+from dinovol_2.model.dinov2_eva import EvaAttention, EvaBlock
+from dinovol_2.model.model import DinoVitStudentTeacher
+from dinovol_2.model.rope import MixedRopePositionEmbedding
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import resolve_distributed_config
 
@@ -67,6 +69,83 @@ def _tensor_parallel_attention_worker(rank: int, world_size: int, init_file: str
                 bool(torch.allclose(x.grad, full_x.grad, atol=1e-5, rtol=1e-5)),
                 bool(torch.isfinite(tp_y).all().item()),
                 bool(torch.isfinite(x.grad).all().item()),
+            )
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _context_parallel_attention_worker(rank: int, world_size: int, init_file: str, queue: mp.Queue) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        torch.manual_seed(4321)
+        full = EvaAttention(
+            dim=16,
+            num_heads=4,
+            qkv_bias=True,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            num_prefix_tokens=1,
+            attention_mode="window_global_3d",
+            window_size_patches=(2, 2, 2),
+            shift_size_patches=(0, 0, 0),
+        ).eval()
+        cp = EvaAttention(
+            dim=16,
+            num_heads=4,
+            qkv_bias=True,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            num_prefix_tokens=1,
+            attention_mode="window_global_3d",
+            window_size_patches=(2, 2, 2),
+            shift_size_patches=(0, 0, 0),
+        ).eval()
+        cp.load_state_dict(full.state_dict())
+        group = dist.new_group(ranks=list(range(world_size)))
+        cp.set_context_parallel(
+            process_group=group,
+            ranks=tuple(range(world_size)),
+            rank=rank,
+            world_size=world_size,
+        )
+
+        x = torch.randn(1, 9, 16)
+        start = rank * 4
+        end = start + 4
+        x_local = torch.cat((x[:, :1], x[:, 1 + start:1 + end]), dim=1)
+        full_y = full(x, rope_shape=(2, 2, 2))
+        cp_y = cp(x_local, rope_shape=(2, 2, 2))
+        expected = torch.cat((full_y[:, :1], full_y[:, 1 + start:1 + end]), dim=1)
+        queue.put((rank, tuple(cp_y.shape), bool(torch.allclose(cp_y, expected, atol=1e-5, rtol=1e-5))))
+    finally:
+        dist.destroy_process_group()
+
+
+def _context_parallel_masked_gather_worker(rank: int, world_size: int, init_file: str, queue: mp.Queue) -> None:
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        group = dist.new_group(ranks=list(range(world_size)))
+        local_positions = torch.tensor([rank, rank + world_size], dtype=torch.long)
+        local_projections = torch.tensor(
+            [[float(rank), 1.0], [float(rank + world_size), 1.0]],
+            requires_grad=True,
+        )
+        expected_positions = torch.arange(world_size * 2, dtype=torch.long)
+        gathered = DinoVitStudentTeacher._gather_context_parallel_masked_projections(
+            local_projections,
+            local_positions,
+            expected_positions,
+            process_group=group,
+            world_size=world_size,
+        )
+        gathered.sum().backward()
+        queue.put(
+            (
+                rank,
+                tuple(gathered.shape),
+                bool(torch.equal(gathered[:, 0].detach().long(), expected_positions)),
+                bool(torch.allclose(local_projections.grad, torch.ones_like(local_projections))),
             )
         )
     finally:
@@ -190,6 +269,49 @@ class ParallelismSupportTests(unittest.TestCase):
             self.assertTrue(finite_output)
             self.assertTrue(finite_grad)
 
+    def test_context_parallel_window_attention_matches_full_local_slice(self) -> None:
+        ctx = mp.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            init_file = str(Path(tmp) / "cp_dist_init")
+            queue: mp.Queue = ctx.Queue()
+            processes = [
+                ctx.Process(target=_context_parallel_attention_worker, args=(rank, 2, init_file, queue))
+                for rank in range(2)
+            ]
+            for process in processes:
+                process.start()
+            results = [queue.get(timeout=30) for _ in processes]
+            for process in processes:
+                process.join(timeout=30)
+                self.assertEqual(process.exitcode, 0)
+
+        self.assertEqual({rank for rank, *_ in results}, {0, 1})
+        for _, output_shape, output_close in results:
+            self.assertEqual(output_shape, (1, 5, 16))
+            self.assertTrue(output_close)
+
+    def test_context_parallel_masked_projection_gather_preserves_order_and_grad(self) -> None:
+        ctx = mp.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            init_file = str(Path(tmp) / "cp_mask_dist_init")
+            queue: mp.Queue = ctx.Queue()
+            processes = [
+                ctx.Process(target=_context_parallel_masked_gather_worker, args=(rank, 2, init_file, queue))
+                for rank in range(2)
+            ]
+            for process in processes:
+                process.start()
+            results = [queue.get(timeout=30) for _ in processes]
+            for process in processes:
+                process.join(timeout=30)
+                self.assertEqual(process.exitcode, 0)
+
+        self.assertEqual({rank for rank, *_ in results}, {0, 1})
+        for _, gathered_shape, order_ok, grad_ok in results:
+            self.assertEqual(gathered_shape, (4, 2))
+            self.assertTrue(order_ok)
+            self.assertTrue(grad_ok)
+
     def test_resolve_tp_ddp_topology_from_env(self) -> None:
         old_env = dict(os.environ)
         try:
@@ -213,6 +335,179 @@ class ParallelismSupportTests(unittest.TestCase):
         self.assertEqual(config["tensor_parallel_rank"], 1)
         self.assertEqual(config["data_parallel_world_size"], 4)
         self.assertEqual(config["data_parallel_rank"], 1)
+
+    def test_resolve_mesh_topology_from_env(self) -> None:
+        old_env = dict(os.environ)
+        try:
+            os.environ.update(
+                {
+                    "WORLD_SIZE": "40",
+                    "LOCAL_WORLD_SIZE": "8",
+                    "RANK": "23",
+                    "LOCAL_RANK": "7",
+                }
+            )
+            config = resolve_distributed_config(
+                {
+                    "parallelism": {
+                        "strategy": "mesh",
+                        "tensor_parallel_size": 4,
+                        "context_parallel_size": 2,
+                        "sharding": "zero1",
+                    }
+                }
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+        self.assertTrue(config["use_ddp"])
+        self.assertEqual(config["tensor_parallel_size"], 4)
+        self.assertEqual(config["context_parallel_size"], 2)
+        self.assertEqual(config["model_parallel_size"], 8)
+        self.assertEqual(config["tensor_parallel_rank"], 3)
+        self.assertEqual(config["context_parallel_rank"], 1)
+        self.assertEqual(config["data_parallel_world_size"], 5)
+        self.assertEqual(config["data_parallel_rank"], 2)
+        self.assertEqual(config["sharding"], "zero1")
+
+    def test_window_global_attention_matches_dense_for_full_mixed_rope_window(self) -> None:
+        torch.manual_seed(7)
+        kwargs = {
+            "dim": 24,
+            "num_heads": 4,
+            "qkv_bias": True,
+            "qkv_fused": True,
+            "num_prefix_tokens": 2,
+            "rope_impl": MixedRopePositionEmbedding,
+            "rope_kwargs": {"base": 100.0},
+            "ndim": 3,
+        }
+        dense = EvaBlock(**kwargs).eval()
+        windowed = EvaBlock(
+            **kwargs,
+            attention_mode="window_global_3d",
+            window_size_patches=(2, 2, 2),
+            shift_size_patches=(0, 0, 0),
+        ).eval()
+        windowed.load_state_dict(dense.state_dict())
+        x = torch.randn(2, 10, 24)
+
+        dense_output = dense(x, rope_shape=(2, 2, 2))
+        windowed_output = windowed(x, rope_shape=(2, 2, 2))
+
+        self.assertTrue(torch.allclose(windowed_output, dense_output, atol=1e-5, rtol=1e-5))
+
+    def test_shifted_window_global_attention_is_finite_and_shape_stable(self) -> None:
+        torch.manual_seed(8)
+        block = EvaBlock(
+            dim=24,
+            num_heads=4,
+            qkv_bias=True,
+            qkv_fused=True,
+            num_prefix_tokens=2,
+            rope_impl=MixedRopePositionEmbedding,
+            rope_kwargs={"base": 100.0},
+            ndim=3,
+            attention_mode="window_global_3d",
+            window_size_patches=(2, 2, 2),
+            shift_size_patches=(1, 1, 1),
+        ).eval()
+        x = torch.randn(2, 66, 24)
+
+        output = block(x, rope_shape=(4, 4, 4))
+
+        self.assertEqual(output.shape, x.shape)
+        self.assertTrue(torch.isfinite(output).all().item())
+
+    def test_mlp_token_chunking_matches_unchunked_block(self) -> None:
+        torch.manual_seed(9)
+        kwargs = {
+            "dim": 24,
+            "num_heads": 4,
+            "qkv_bias": True,
+            "qkv_fused": True,
+            "num_prefix_tokens": 2,
+            "attn_drop": 0.0,
+            "proj_drop": 0.0,
+            "drop_path": 0.0,
+            "norm_layer": torch.nn.LayerNorm,
+        }
+        full = EvaBlock(**kwargs).eval()
+        chunked = EvaBlock(**kwargs, mlp_token_chunk_size=5).eval()
+        chunked.load_state_dict(full.state_dict())
+        x = torch.randn(2, 17, 24)
+
+        self.assertTrue(torch.allclose(chunked(x), full(x), atol=1e-6, rtol=1e-6))
+
+    def test_view_chunking_matches_full_forward_and_can_drop_local_patch_tokens(self) -> None:
+        torch.manual_seed(10)
+        config = {
+            "model_type": "v2",
+            "input_channels": 1,
+            "global_crops_size": [8, 8, 8],
+            "local_crops_size": [4, 4, 4],
+            "patch_size": [4, 4, 4],
+            "embed_dim": 24,
+            "depth": 1,
+            "num_heads": 4,
+            "num_reg_tokens": 1,
+            "dino_out_dim": 16,
+            "ibot_out_dim": 16,
+            "dino_head_hidden_dim": 32,
+            "dino_head_bottleneck_dim": 16,
+            "ibot_head_hidden_dim": 32,
+            "ibot_head_bottleneck_dim": 16,
+            "use_abs_pos_emb": False,
+            "use_rot_pos_emb": False,
+            "drop_path_rate": 0.0,
+            "masked_projection_chunk_size": 2,
+        }
+        full = DinoVitStudentTeacher(config).eval()
+        chunked = DinoVitStudentTeacher({**config, "view_chunk_size": 1}).eval()
+        chunked.load_state_dict(full.state_dict())
+
+        student_input = torch.randn(2, 1, 8, 8, 8)
+        local_input = torch.randn(3, 1, 4, 4, 4)
+        masks = torch.zeros(2, 8, dtype=torch.bool)
+        mask_indices = torch.tensor([0, 9], dtype=torch.long)
+        with torch.no_grad():
+            full_outputs = full(
+                student_input,
+                student_masks=masks,
+                local_student_input=local_input,
+                mask_indices_list=mask_indices,
+                n_masked_patches=2,
+                return_teacher=False,
+            )["student"]
+            chunked_outputs = chunked(
+                student_input,
+                student_masks=masks,
+                local_student_input=local_input,
+                mask_indices_list=mask_indices,
+                n_masked_patches=2,
+                return_teacher=False,
+            )["student"]
+
+        for key in ("cls_tokens", "patch_tokens"):
+            self.assertTrue(torch.allclose(chunked_outputs["global"][key], full_outputs["global"][key], atol=1e-6, rtol=1e-6))
+        for key in ("global_cls_projections", "global_masked_patch_projections"):
+            self.assertTrue(torch.allclose(chunked_outputs[key], full_outputs[key], atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(chunked_outputs["local"]["cls_projections"], full_outputs["local"]["cls_projections"], atol=1e-6, rtol=1e-6))
+
+        drop_local = DinoVitStudentTeacher({**config, "view_chunk_size": 1, "discard_local_patch_tokens": True}).eval()
+        drop_local.load_state_dict(full.state_dict())
+        with torch.no_grad():
+            drop_outputs = drop_local(
+                student_input,
+                student_masks=masks,
+                local_student_input=local_input,
+                mask_indices_list=mask_indices,
+                n_masked_patches=2,
+                return_teacher=False,
+            )["student"]
+        self.assertNotIn("patch_tokens", drop_outputs["local"])
+        self.assertTrue(torch.allclose(drop_outputs["local"]["cls_projections"], full_outputs["local"]["cls_projections"], atol=1e-6, rtol=1e-6))
 
 
 if __name__ == "__main__":

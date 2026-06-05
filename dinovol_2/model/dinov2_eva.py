@@ -5,6 +5,7 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 from timm.layers import trunc_normal_, use_fused_attn, DropPath, SwiGLU, GluMlp, Mlp
 from torch import nn
@@ -58,6 +59,10 @@ def _reduce_from_tensor_parallel_region(x: torch.Tensor, process_group):
     return _ReduceFromTensorParallelRegion.apply(x, process_group)
 
 
+def _unwrap_checkpoint_module(module: nn.Module) -> nn.Module:
+    return getattr(module, "_checkpoint_wrapped_module", module)
+
+
 class InitWeights_He(object):
     def __init__(self, neg_slope: float = 1e-2):
         self.neg_slope = neg_slope
@@ -84,6 +89,9 @@ class EvaAttention(nn.Module):
             proj_drop: float = 0.,
             attn_head_dim: Optional[int] = None,
             norm_layer: Optional[Callable] = None,
+            attention_mode: str = "dense",
+            window_size_patches: Optional[Tuple[int, int, int]] = None,
+            shift_size_patches: Optional[Tuple[int, int, int]] = None,
     ):
         """
 
@@ -134,6 +142,26 @@ class EvaAttention(nn.Module):
         self.tensor_parallel_rank = 0
         self.tensor_parallel_group = None
         self.tensor_parallel_ranks: tuple[int, ...] | None = None
+        self.context_parallel_size = 1
+        self.context_parallel_rank = 0
+        self.context_parallel_group = None
+        self.context_parallel_ranks: tuple[int, ...] | None = None
+        self.attention_mode = str(attention_mode).strip().lower()
+        if self.attention_mode not in {"dense", "context_parallel_dense", "window_global_3d"}:
+            raise ValueError(
+                "attention_mode must be one of dense, context_parallel_dense, or window_global_3d; "
+                f"got {attention_mode!r}"
+            )
+        self.window_size_patches = self._normalize_window_tuple(
+            window_size_patches,
+            name="window_size_patches",
+            default=(0, 0, 0),
+        )
+        self.shift_size_patches = self._normalize_window_tuple(
+            shift_size_patches,
+            name="shift_size_patches",
+            default=(0, 0, 0),
+        )
 
     @property
     def is_tensor_parallel(self) -> bool:
@@ -147,11 +175,80 @@ class EvaAttention(nn.Module):
     def local_num_heads(self) -> int:
         return self.num_heads // self.tensor_parallel_size
 
+    @staticmethod
+    def _normalize_window_tuple(
+            value: Optional[Tuple[int, int, int]],
+            *,
+            name: str,
+            default: Tuple[int, int, int],
+    ) -> Tuple[int, int, int]:
+        if value is None:
+            return default
+        if isinstance(value, int):
+            result = (int(value), int(value), int(value))
+        else:
+            result = tuple(int(item) for item in value)
+        if len(result) != 3:
+            raise ValueError(f"{name} must contain three integers, got {result}")
+        if any(item < 0 for item in result):
+            raise ValueError(f"{name} must be non-negative, got {result}")
+        return result
+
     @property
     def local_channel_slice(self) -> slice:
         start = self.tensor_parallel_rank * self.local_num_heads * self.head_dim
         stop = start + self.local_num_heads * self.head_dim
         return slice(start, stop)
+
+    @property
+    def is_context_parallel(self) -> bool:
+        return self.context_parallel_size > 1
+
+    def _context_parallel_patch_range(self, rope_shape: Optional[Tuple[int, ...]]) -> tuple[int, int, int]:
+        if rope_shape is None:
+            raise ValueError("context parallel attention requires rope_shape.")
+        n_patches = math.prod(int(dim) for dim in rope_shape)
+        if n_patches % self.context_parallel_size != 0:
+            raise ValueError(
+                f"patch token count {n_patches} must be divisible by context_parallel_size="
+                f"{self.context_parallel_size}."
+            )
+        local_tokens = n_patches // self.context_parallel_size
+        start = self.context_parallel_rank * local_tokens
+        return start, start + local_tokens, n_patches
+
+    def _gather_context_parallel_input(
+            self,
+            x: torch.Tensor,
+            *,
+            rope_shape: Optional[Tuple[int, ...]],
+    ) -> tuple[torch.Tensor, slice] | tuple[torch.Tensor, None]:
+        if not self.is_context_parallel:
+            return x, None
+        if self.context_parallel_group is None:
+            raise RuntimeError("context_parallel_group is not initialized.")
+        if self.attention_mode != "window_global_3d":
+            raise ValueError("context parallel token sharding currently requires window_global_3d attention.")
+        start, end, n_patches = self._context_parallel_patch_range(rope_shape)
+        local_patch_tokens = end - start
+        if x.shape[1] != self.num_prefix_tokens + local_patch_tokens:
+            raise ValueError(
+                "context parallel attention expected local patch-token input: "
+                f"got tokens={x.shape[1]}, prefix={self.num_prefix_tokens}, local_patches={local_patch_tokens}, "
+                f"full_patches={n_patches}"
+            )
+        prefix = x[:, :self.num_prefix_tokens]
+        local_patch = x[:, self.num_prefix_tokens:].contiguous()
+        gathered = dist_nn.all_gather(local_patch, group=self.context_parallel_group)
+        full_patch = torch.cat(tuple(gathered), dim=1)
+        if full_patch.shape[1] != n_patches:
+            raise RuntimeError(
+                f"context parallel gather produced {full_patch.shape[1]} patches, expected {n_patches}."
+            )
+        return torch.cat((prefix, full_patch), dim=1), slice(
+            self.num_prefix_tokens + start,
+            self.num_prefix_tokens + end,
+        )
 
     def _qkv_indices_for_channel_slice(self, channel_slice: slice) -> torch.Tensor:
         all_head_dim = self.proj.in_features
@@ -193,6 +290,25 @@ class EvaAttention(nn.Module):
         self.tensor_parallel_rank = rank
         self.tensor_parallel_size = world_size
 
+    def set_context_parallel(
+        self,
+        *,
+        process_group=None,
+        ranks: tuple[int, ...] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        world_size = int(world_size)
+        rank = int(rank)
+        if world_size <= 0:
+            raise ValueError(f"context parallel world_size must be positive, got {world_size}.")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"context parallel rank must be in [0, {world_size}), got {rank}.")
+        self.context_parallel_group = process_group
+        self.context_parallel_ranks = ranks
+        self.context_parallel_rank = rank
+        self.context_parallel_size = world_size
+
     @staticmethod
     def _slice_rope(rope: Optional[RopeEmbedding], head_slice: slice) -> Optional[RopeEmbedding]:
         if rope is None:
@@ -233,6 +349,146 @@ class EvaAttention(nn.Module):
             self.v_proj.bias[channel_slice] if self.v_proj.bias is not None else None,
         ).reshape(B, N, self.local_num_heads, self.head_dim).transpose(1, 2)
         return q, k, v
+
+    @staticmethod
+    def _partition_3d_windows(
+            x: torch.Tensor,
+            spatial_shape: Tuple[int, int, int],
+            window_shape: Tuple[int, int, int],
+    ) -> torch.Tensor:
+        bsz, heads, depth, height, width, channels = x.shape
+        window_d, window_h, window_w = window_shape
+        return (
+            x.view(
+                bsz,
+                heads,
+                depth // window_d,
+                window_d,
+                height // window_h,
+                window_h,
+                width // window_w,
+                window_w,
+                channels,
+            )
+            .permute(0, 2, 4, 6, 1, 3, 5, 7, 8)
+            .reshape(-1, heads, window_d * window_h * window_w, channels)
+        )
+
+    @staticmethod
+    def _reverse_3d_windows(
+            windows: torch.Tensor,
+            *,
+            batch_size: int,
+            spatial_shape: Tuple[int, int, int],
+            window_shape: Tuple[int, int, int],
+    ) -> torch.Tensor:
+        depth, height, width = spatial_shape
+        window_d, window_h, window_w = window_shape
+        heads = windows.shape[1]
+        channels = windows.shape[-1]
+        return (
+            windows.view(
+                batch_size,
+                depth // window_d,
+                height // window_h,
+                width // window_w,
+                heads,
+                window_d,
+                window_h,
+                window_w,
+                channels,
+            )
+            .permute(0, 4, 1, 5, 2, 6, 3, 7, 8)
+            .reshape(batch_size, heads, depth, height, width, channels)
+        )
+
+    def _window_global_attention(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            *,
+            rope_shape: Optional[Tuple[int, ...]],
+    ) -> torch.Tensor:
+        if rope_shape is None or len(rope_shape) != 3:
+            raise ValueError("window_global_3d attention requires a 3D patch grid shape.")
+        spatial_shape = tuple(int(dim) for dim in rope_shape)
+        if any(dim <= 0 for dim in spatial_shape):
+            raise ValueError(f"window_global_3d received invalid spatial shape: {spatial_shape}")
+        patch_tokens = math.prod(spatial_shape)
+        if q.shape[-2] != self.num_prefix_tokens + patch_tokens:
+            raise ValueError(
+                "window_global_3d token count mismatch: "
+                f"tokens={q.shape[-2]}, prefix={self.num_prefix_tokens}, patch_grid={spatial_shape}"
+            )
+
+        window_shape = tuple(
+            min(window, dim) if window > 0 else dim
+            for window, dim in zip(self.window_size_patches, spatial_shape)
+        )
+        for dim, window in zip(spatial_shape, window_shape):
+            if dim % window != 0:
+                raise ValueError(
+                    "window_global_3d requires each patch-grid dimension to be divisible by the window size; "
+                    f"got spatial_shape={spatial_shape}, window_size_patches={window_shape}"
+                )
+        shift_shape = tuple(
+            min(shift, window - 1) if dim > window else 0
+            for shift, window, dim in zip(self.shift_size_patches, window_shape, spatial_shape)
+        )
+
+        q_prefix = q[:, :, :self.num_prefix_tokens]
+        k_prefix = k[:, :, :self.num_prefix_tokens]
+        v_prefix = v[:, :, :self.num_prefix_tokens]
+        q_patch = q[:, :, self.num_prefix_tokens:].reshape(*q.shape[:2], *spatial_shape, q.shape[-1])
+        k_patch = k[:, :, self.num_prefix_tokens:].reshape(*k.shape[:2], *spatial_shape, k.shape[-1])
+        v_patch = v[:, :, self.num_prefix_tokens:].reshape(*v.shape[:2], *spatial_shape, v.shape[-1])
+
+        prefix_out = F.scaled_dot_product_attention(
+            q_prefix,
+            k,
+            v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+
+        if any(shift_shape):
+            roll_shifts = tuple(-shift for shift in shift_shape)
+            q_patch = torch.roll(q_patch, shifts=roll_shifts, dims=(2, 3, 4))
+            k_patch = torch.roll(k_patch, shifts=roll_shifts, dims=(2, 3, 4))
+            v_patch = torch.roll(v_patch, shifts=roll_shifts, dims=(2, 3, 4))
+
+        q_windows = self._partition_3d_windows(q_patch, spatial_shape, window_shape)
+        k_windows = self._partition_3d_windows(k_patch, spatial_shape, window_shape)
+        v_windows = self._partition_3d_windows(v_patch, spatial_shape, window_shape)
+        windows_per_sample = q_windows.shape[0] // q.shape[0]
+        prefix_k_windows = (
+            k_prefix[:, None]
+            .expand(-1, windows_per_sample, -1, -1, -1)
+            .reshape(-1, k_prefix.shape[1], k_prefix.shape[2], k_prefix.shape[3])
+        )
+        prefix_v_windows = (
+            v_prefix[:, None]
+            .expand(-1, windows_per_sample, -1, -1, -1)
+            .reshape(-1, v_prefix.shape[1], v_prefix.shape[2], v_prefix.shape[3])
+        )
+        k_windows = torch.cat((prefix_k_windows, k_windows), dim=-2)
+        v_windows = torch.cat((prefix_v_windows, v_windows), dim=-2)
+        patch_windows = F.scaled_dot_product_attention(
+            q_windows,
+            k_windows,
+            v_windows,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+        patch_out = self._reverse_3d_windows(
+            patch_windows,
+            batch_size=q.shape[0],
+            spatial_shape=spatial_shape,
+            window_shape=window_shape,
+        )
+        if any(shift_shape):
+            patch_out = torch.roll(patch_out, shifts=shift_shape, dims=(2, 3, 4))
+        patch_out = patch_out.reshape(q.shape[0], q.shape[1], patch_tokens, q.shape[-1])
+        return torch.cat((prefix_out, patch_out), dim=-2)
 
     def _project_tensor_parallel_output(self, x: torch.Tensor) -> torch.Tensor:
         channel_slice = self.local_channel_slice
@@ -314,7 +570,10 @@ class EvaAttention(nn.Module):
             x,
             rope: Optional[RopeEmbedding] = None,
             attn_mask: Optional[torch.Tensor] = None,
+            rope_shape: Optional[Tuple[int, ...]] = None,
     ):
+        context_output_slice: slice | None
+        x, context_output_slice = self._gather_context_parallel_input(x, rope_shape=rope_shape)
         B, N, C = x.shape
         
         if self.is_tensor_parallel:
@@ -346,7 +605,11 @@ class EvaAttention(nn.Module):
             q = apply_rotary_embedding(q, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
             k = apply_rotary_embedding(k, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
         
-        if self.fused_attn:
+        if self.attention_mode == "window_global_3d":
+            if attn_mask is not None:
+                raise ValueError("attn_mask is not supported with window_global_3d attention.")
+            x = self._window_global_attention(q, k, v, rope_shape=rope_shape)
+        elif self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
@@ -373,6 +636,8 @@ class EvaAttention(nn.Module):
         else:
             x = self.proj(x)
         x = self.proj_drop(x)
+        if context_output_slice is not None:
+            x = torch.cat((x[:, :self.num_prefix_tokens], x[:, context_output_slice]), dim=1)
         return x
 
 
@@ -400,6 +665,10 @@ class EvaBlock(nn.Module):
             rope_impl=None,
             rope_kwargs=None,
             ndim: Optional[int] = None,
+            attention_mode: str = "dense",
+            window_size_patches: Optional[Tuple[int, int, int]] = None,
+            shift_size_patches: Optional[Tuple[int, int, int]] = None,
+            mlp_token_chunk_size: Optional[int] = None,
     ):
         """
 
@@ -434,6 +703,9 @@ class EvaBlock(nn.Module):
             proj_drop=proj_drop,
             attn_head_dim=attn_head_dim,
             norm_layer=norm_layer if scale_attn_inner else None,
+            attention_mode=attention_mode,
+            window_size_patches=window_size_patches,
+            shift_size_patches=shift_size_patches,
         )
         self.rope_embed = None
         if rope_impl is not None:
@@ -481,6 +753,25 @@ class EvaBlock(nn.Module):
             )
         self.gamma_2 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
         self.drop_path2 = DropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
+        self.mlp_token_chunk_size = self._normalize_optional_positive_int(
+            mlp_token_chunk_size,
+            name="mlp_token_chunk_size",
+        )
+
+    @staticmethod
+    def _normalize_optional_positive_int(value: Optional[int], *, name: str) -> Optional[int]:
+        if value is None:
+            return None
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f"{name} must be positive when set, got {value}")
+        return value
+
+    def _forward_mlp(self, x: torch.Tensor) -> torch.Tensor:
+        chunk_size = self.mlp_token_chunk_size
+        if chunk_size is None or x.shape[1] <= chunk_size:
+            return self.mlp(x)
+        return torch.cat([self.mlp(chunk) for chunk in x.split(chunk_size, dim=1)], dim=1)
     
     def forward(
             self,
@@ -498,11 +789,11 @@ class EvaBlock(nn.Module):
                     raise ValueError("rope_shape must be provided when using per-block RoPE")
                 rope = self.rope_embed.get_embed(rope_shape)
         if self.gamma_1 is None:
-            x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
-            x = x + self.drop_path2(self.mlp(self.norm2(x)))
+            x = x + self.drop_path1(self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, rope_shape=rope_shape))
+            x = x + self.drop_path2(self._forward_mlp(self.norm2(x)))
         else:
-            x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask))
-            x = x + self.drop_path2(self.gamma_2 * self.mlp(self.norm2(x)))
+            x = x + self.drop_path1(self.gamma_1 * self.attn(self.norm1(x), rope=rope, attn_mask=attn_mask, rope_shape=rope_shape))
+            x = x + self.drop_path2(self.gamma_2 * self._forward_mlp(self.norm2(x)))
         return x
 
     def set_tensor_parallel(
@@ -514,6 +805,21 @@ class EvaBlock(nn.Module):
         world_size: int = 1,
     ) -> None:
         self.attn.set_tensor_parallel(
+            process_group=process_group,
+            ranks=ranks,
+            rank=rank,
+            world_size=world_size,
+        )
+
+    def set_context_parallel(
+        self,
+        *,
+        process_group=None,
+        ranks: tuple[int, ...] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.attn.set_context_parallel(
             process_group=process_group,
             ranks=ranks,
             rank=rank,
@@ -569,6 +875,26 @@ class Eva(nn.Module):
         return result
 
     @staticmethod
+    def _normalize_optional_nonnegative_shape(
+            value: Optional[int | Tuple[int, ...]],
+            *,
+            ndim: int,
+            name: str,
+    ) -> Optional[Tuple[int, ...]]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+            return tuple([int(value)] * ndim)
+        result = tuple(int(v) for v in value)
+        if len(result) != ndim:
+            raise ValueError(f"{name} must provide {ndim} values, got {result}")
+        if any(v < 0 for v in result):
+            raise ValueError(f"{name} must be non-negative, got {result}")
+        return result
+
+    @staticmethod
     def _normalize_optional_positive_int(
             value: Optional[int],
             *,
@@ -618,6 +944,11 @@ class Eva(nn.Module):
             grad_checkpointing=False,
             deeper_embed_patch_chunk_size: Optional[int | Tuple[int, ...]] = None,
             deeper_embed_batch_chunk_size: Optional[int] = None,
+            attention_mode: str = "dense",
+            window_size_patches: Optional[Tuple[int, int, int]] = None,
+            shift_size_patches: Optional[Tuple[int, int, int]] = None,
+            alternate_window_shift: bool = True,
+            mlp_token_chunk_size: Optional[int] = None,
     ):
         """
         Diff to timm implementation
@@ -648,6 +979,10 @@ class Eva(nn.Module):
         self.deeper_embed_batch_chunk_size = self._normalize_optional_positive_int(
             deeper_embed_batch_chunk_size,
             name="deeper_embed_batch_chunk_size",
+        )
+        self.mlp_token_chunk_size = self._normalize_optional_positive_int(
+            mlp_token_chunk_size,
+            name="mlp_token_chunk_size",
         )
 
         if self.embedding_type == "deeper":
@@ -688,6 +1023,27 @@ class Eva(nn.Module):
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = grad_checkpointing
+        self.attention_mode = str(attention_mode).strip().lower()
+        if self.attention_mode not in {"dense", "context_parallel_dense", "window_global_3d"}:
+            raise ValueError(
+                "attention_mode must be one of dense, context_parallel_dense, or window_global_3d; "
+                f"got {attention_mode!r}"
+            )
+        self.window_size_patches = self._normalize_optional_chunk_shape(
+            window_size_patches,
+            ndim=self.ndim,
+            name="window_size_patches",
+        )
+        self.shift_size_patches = self._normalize_optional_nonnegative_shape(
+            shift_size_patches,
+            ndim=self.ndim,
+            name="shift_size_patches",
+        )
+        self.alternate_window_shift = bool(alternate_window_shift)
+        if self.attention_mode == "window_global_3d" and self.window_size_patches is None:
+            raise ValueError("window_global_3d attention requires window_size_patches.")
+        if self.shift_size_patches is None:
+            self.shift_size_patches = tuple(0 for _ in range(self.ndim))
         
         self.num_reg_tokens = num_reg_tokens
         self.num_class_tokens = (1 if class_token else 0)
@@ -748,11 +1104,26 @@ class Eva(nn.Module):
                 rope_impl=rope_impl if self.use_per_block_rope else None,
                 rope_kwargs=rope_kwargs if self.use_per_block_rope else None,
                 ndim=self.ndim,
+                attention_mode=self.attention_mode,
+                window_size_patches=self.window_size_patches,
+                shift_size_patches=(
+                    self.shift_size_patches
+                    if self.attention_mode == "window_global_3d" and (not self.alternate_window_shift or i % 2 == 1)
+                    else tuple(0 for _ in range(self.ndim))
+                ),
+                mlp_token_chunk_size=self.mlp_token_chunk_size,
             )
             for i in range(depth)])
         
         self.norm = norm_layer(embed_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.context_parallel_size = 1
+        self.context_parallel_rank = 0
+        self.context_parallel_group = None
+        self.context_parallel_ranks: tuple[int, ...] | None = None
+        self._last_context_parallel_patch_start = 0
+        self._last_context_parallel_patch_end = math.prod(self.global_ref_feat_shape)
+        self._last_context_parallel_full_patch_tokens = math.prod(self.global_ref_feat_shape)
         
         self._init_weights()
     
@@ -1014,6 +1385,12 @@ class Eva(nn.Module):
     
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        if self.context_parallel_size > 1:
+            start, end, n_patches = self.context_parallel_patch_range(rope_shape)
+            self._last_context_parallel_patch_start = start
+            self._last_context_parallel_patch_end = end
+            self._last_context_parallel_full_patch_tokens = n_patches
+            x = torch.cat((x[:, :self.num_prefix_tokens], x[:, self.num_prefix_tokens + start:self.num_prefix_tokens + end]), dim=1)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -1049,7 +1426,7 @@ class Eva(nn.Module):
             world_size: int = 1,
     ) -> None:
         for block in self.blocks:
-            set_tensor_parallel = getattr(block, "set_tensor_parallel", None)
+            set_tensor_parallel = getattr(_unwrap_checkpoint_module(block), "set_tensor_parallel", None)
             if callable(set_tensor_parallel):
                 set_tensor_parallel(
                     process_group=process_group,
@@ -1058,9 +1435,56 @@ class Eva(nn.Module):
                     world_size=world_size,
                 )
 
+    def context_parallel_patch_range(self, target_size: Tuple[int, ...]) -> tuple[int, int, int]:
+        n_patches = math.prod(int(dim) for dim in target_size)
+        if self.context_parallel_size <= 1:
+            return 0, n_patches, n_patches
+        if n_patches % self.context_parallel_size != 0:
+            raise ValueError(
+                f"patch token count {n_patches} must be divisible by context_parallel_size="
+                f"{self.context_parallel_size}."
+            )
+        local_tokens = n_patches // self.context_parallel_size
+        start = self.context_parallel_rank * local_tokens
+        return start, start + local_tokens, n_patches
+
+    def set_context_parallel(
+            self,
+            *,
+            process_group=None,
+            ranks: tuple[int, ...] | None = None,
+            rank: int = 0,
+            world_size: int = 1,
+    ) -> None:
+        world_size = int(world_size)
+        rank = int(rank)
+        if world_size <= 0:
+            raise ValueError(f"context parallel world_size must be positive, got {world_size}.")
+        if rank < 0 or rank >= world_size:
+            raise ValueError(f"context parallel rank must be in [0, {world_size}), got {rank}.")
+        if world_size > 1 and self.attention_mode != "window_global_3d":
+            raise ValueError("context parallel token sharding currently requires window_global_3d attention.")
+        self.context_parallel_group = process_group
+        self.context_parallel_ranks = ranks
+        self.context_parallel_rank = rank
+        self.context_parallel_size = world_size
+        for block in self.blocks:
+            set_context_parallel = getattr(_unwrap_checkpoint_module(block), "set_context_parallel", None)
+            if callable(set_context_parallel):
+                set_context_parallel(
+                    process_group=process_group,
+                    ranks=ranks,
+                    rank=rank,
+                    world_size=world_size,
+                )
+
     def sync_tensor_parallel_parameters(self, optimizer: torch.optim.Optimizer | None = None) -> None:
         for block in self.blocks:
-            sync_tensor_parallel_parameters = getattr(block, "sync_tensor_parallel_parameters", None)
+            sync_tensor_parallel_parameters = getattr(
+                _unwrap_checkpoint_module(block),
+                "sync_tensor_parallel_parameters",
+                None,
+            )
             if callable(sync_tensor_parallel_parameters):
                 sync_tensor_parallel_parameters(optimizer=optimizer)
     
@@ -1173,7 +1597,7 @@ class BlockChunk(nn.ModuleList):
             world_size: int = 1,
     ) -> None:
         for block in self:
-            block.set_tensor_parallel(
+            _unwrap_checkpoint_module(block).set_tensor_parallel(
                 process_group=process_group,
                 ranks=ranks,
                 rank=rank,
@@ -1182,7 +1606,23 @@ class BlockChunk(nn.ModuleList):
 
     def sync_tensor_parallel_parameters(self, optimizer: torch.optim.Optimizer | None = None) -> None:
         for block in self:
-            block.sync_tensor_parallel_parameters(optimizer=optimizer)
+            _unwrap_checkpoint_module(block).sync_tensor_parallel_parameters(optimizer=optimizer)
+
+    def set_context_parallel(
+            self,
+            *,
+            process_group=None,
+            ranks: tuple[int, ...] | None = None,
+            rank: int = 0,
+            world_size: int = 1,
+    ) -> None:
+        for block in self:
+            _unwrap_checkpoint_module(block).set_context_parallel(
+                process_group=process_group,
+                ranks=ranks,
+                rank=rank,
+                world_size=world_size,
+            )
 
 
 class EvaWithChunking(Eva):
@@ -1206,6 +1646,12 @@ class EvaWithChunking(Eva):
     
     def forward_features(self, x, masks=None, *, view_kind: str = "global"):
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind)
+        if self.context_parallel_size > 1:
+            start, end, n_patches = self.context_parallel_patch_range(rope_shape)
+            self._last_context_parallel_patch_start = start
+            self._last_context_parallel_patch_end = end
+            self._last_context_parallel_full_patch_tokens = n_patches
+            x = torch.cat((x[:, :self.num_prefix_tokens], x[:, self.num_prefix_tokens + start:self.num_prefix_tokens + end]), dim=1)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         
         if self.chunked_blocks:

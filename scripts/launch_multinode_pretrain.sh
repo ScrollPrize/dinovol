@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${CONFIG:?Set CONFIG to a JSON config path.}"
 : "${NNODES:?Set NNODES to the number of nodes.}"
 : "${NODE_RANK:?Set NODE_RANK to this node zero-based rank.}"
 : "${MASTER_ADDR:?Set MASTER_ADDR to the rendezvous host or IP.}"
@@ -10,16 +9,44 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 RDZV_ID="${RDZV_ID:-dinovol-pretrain}"
 MODULE="${MODULE:-dinovol_2.pretrain}"
+CONFIG_ARGS=()
+if [[ -n "${CONFIG:-}" ]]; then
+  CONFIG_ARGS=("${CONFIG}")
+elif [[ "${CONFIG_REQUIRED:-1}" == "1" ]]; then
+  echo "Set CONFIG to a JSON config path, or set CONFIG_REQUIRED=0 for configless modules." >&2
+  exit 2
+fi
 LOCAL_ADDR_ARGS=()
 if [[ -n "${LOCAL_ADDR:-}" ]]; then
   LOCAL_ADDR_ARGS=(--local-addr="${LOCAL_ADDR}")
 fi
 
+UV_BIN="${UV_BIN:-$(command -v uv || true)}"
+if [[ -z "${UV_BIN}" && -x "${HOME}/.local/bin/uv" ]]; then
+  UV_BIN="${HOME}/.local/bin/uv"
+fi
+if [[ -z "${UV_BIN}" ]]; then
+  echo "uv was not found on PATH or at ~/.local/bin/uv; set UV_BIN." >&2
+  exit 2
+fi
+
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export NCCL_IB_ADDR_FAMILY="${NCCL_IB_ADDR_FAMILY:-AF_INET}"
+export NCCL_IB_ROCE_VERSION_NUM="${NCCL_IB_ROCE_VERSION_NUM:-2}"
 
-uv run python -m torch.distributed.run \
+if [[ "${REQUIRE_NCCL_RDMA_ENV:-0}" == "1" && "${NCCL_IB_DISABLE:-0}" != "1" ]]; then
+  : "${NCCL_IB_HCA:?Set NCCL_IB_HCA for RDMA runs or set NCCL_IB_DISABLE=1 for TCP fallback.}"
+  : "${NCCL_IB_GID_INDEX:?Set NCCL_IB_GID_INDEX for RDMA/RoCE runs.}"
+fi
+
+if [[ -z "${LOCAL_ADDR:-}" ]]; then
+  echo "warning: LOCAL_ADDR is not set; torchrun may advertise a hostname that peer nodes cannot route." >&2
+fi
+
+"${UV_BIN}" run python -m torch.distributed.run \
   --nnodes="${NNODES}" \
   --nproc-per-node="${NPROC_PER_NODE}" \
   --node-rank="${NODE_RANK}" \
@@ -27,4 +54,4 @@ uv run python -m torch.distributed.run \
   --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
   --rdzv-id="${RDZV_ID}" \
   "${LOCAL_ADDR_ARGS[@]}" \
-  -m "${MODULE}" "${CONFIG}" "$@"
+  -m "${MODULE}" "${CONFIG_ARGS[@]}" "$@"

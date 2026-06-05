@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.init import trunc_normal_
@@ -41,6 +42,11 @@ _BACKBONE_DEFAULTS = {
     "num_reg_tokens": 4,
     "grad_checkpointing": False,
     "block_chunks": 0,
+    "attention_mode": "dense",
+    "window_size_patches": None,
+    "shift_size_patches": None,
+    "alternate_window_shift": True,
+    "mlp_token_chunk_size": None,
 }
 
 _BACKBONE_DEFAULTS_V2 = {
@@ -70,6 +76,11 @@ _BACKBONE_DEFAULTS_V2 = {
     "num_reg_tokens": 4,
     "grad_checkpointing": False,
     "block_chunks": 0,
+    "attention_mode": "dense",
+    "window_size_patches": None,
+    "shift_size_patches": None,
+    "alternate_window_shift": True,
+    "mlp_token_chunk_size": None,
 }
 
 _ROPE_KWARG_CONFIG_KEYS = {
@@ -236,7 +247,8 @@ def _materialize_backbone_config(config: Mapping[str, Any]) -> dict[str, Any]:
     local_crop_value = backbone_config["local_crops_size"] or global_crops_size
     local_crops_size = _as_3tuple(local_crop_value)
 
-    materialized = dict(backbone_config)
+    materialized = dict(config)
+    materialized.update(backbone_config)
     materialized.update(
         {
             "global_crops_size": global_crops_size,
@@ -244,6 +256,18 @@ def _materialize_backbone_config(config: Mapping[str, Any]) -> dict[str, Any]:
             "patch_size": _as_3tuple(backbone_config["patch_size"]),
             "rope_type": rope_type,
             "rope_kwargs": dict(rope_kwargs),
+            "attention_mode": str(backbone_config.get("attention_mode", "dense")).strip().lower(),
+            "window_size_patches": (
+                _as_3tuple(backbone_config["window_size_patches"])
+                if backbone_config.get("window_size_patches") is not None
+                else None
+            ),
+            "shift_size_patches": (
+                _as_3tuple(backbone_config["shift_size_patches"])
+                if backbone_config.get("shift_size_patches") is not None
+                else None
+            ),
+            "alternate_window_shift": bool(backbone_config.get("alternate_window_shift", True)),
         }
     )
     if "model_type" in config:
@@ -374,6 +398,11 @@ class DinoVitStudentTeacher(nn.Module):
             self.config.get("ibot_projection_chunk_size", self.config.get("masked_projection_chunk_size")),
             name="ibot_projection_chunk_size",
         )
+        self.view_chunk_size = self._resolve_positive_optional_int(
+            self.config.get("view_chunk_size"),
+            name="view_chunk_size",
+        )
+        self.discard_local_patch_tokens = bool(self.config.get("discard_local_patch_tokens", False))
         student_backbone = self._build_backbone(self.config)
         teacher_backbone = deepcopy(student_backbone)
 
@@ -419,7 +448,11 @@ class DinoVitStudentTeacher(nn.Module):
         local_crops_size = _as_3tuple(backbone_config["local_crops_size"])
         block_chunks = int(backbone_config["block_chunks"])
         backbone_cls = EvaWithChunking if block_chunks > 0 else Eva
-        kwargs = dict(backbone_config)
+        kwargs = {
+            key: backbone_config[key]
+            for key in _resolve_backbone_defaults(config)
+            if key in backbone_config
+        }
         kwargs.update(
             {
                 "global_crops_size": global_crops_size,
@@ -616,6 +649,75 @@ class DinoVitStudentTeacher(nn.Module):
     def project_patch_tokens(self, branch: nn.ModuleDict, patch_tokens: torch.Tensor) -> torch.Tensor:
         return self._apply_head_chunked(branch.ibot_head, patch_tokens, self.masked_projection_chunk_size)
 
+    @staticmethod
+    def _context_parallel_info(branch: nn.ModuleDict) -> tuple[int, int, int, int, Any] | None:
+        backbone = branch.backbone
+        cp_size = int(getattr(backbone, "context_parallel_size", 1))
+        if cp_size <= 1:
+            return None
+        start = int(getattr(backbone, "_last_context_parallel_patch_start", 0))
+        end = int(getattr(backbone, "_last_context_parallel_patch_end", 0))
+        full_tokens = int(getattr(backbone, "_last_context_parallel_full_patch_tokens", 0))
+        group = getattr(backbone, "context_parallel_group", None)
+        if group is None:
+            raise RuntimeError("context_parallel_group is not initialized on the backbone.")
+        return cp_size, start, end, full_tokens, group
+
+    @staticmethod
+    def _gather_context_parallel_masked_projections(
+        local_projections: torch.Tensor,
+        local_positions: torch.Tensor,
+        expected_positions: torch.Tensor,
+        *,
+        process_group: Any,
+        world_size: int,
+    ) -> torch.Tensor:
+        if expected_positions.numel() == 0:
+            return local_projections[:0]
+        count = torch.tensor([local_projections.shape[0]], device=local_projections.device, dtype=torch.long)
+        counts = [torch.zeros_like(count) for _ in range(world_size)]
+        dist.all_gather(counts, count, group=process_group)
+        count_values = [int(item.item()) for item in counts]
+        max_count = max(count_values)
+        if max_count == 0:
+            return local_projections[:0]
+
+        padded_projections = local_projections.new_zeros((max_count, local_projections.shape[-1]))
+        padded_positions = local_positions.new_full((max_count,), -1)
+        if local_projections.shape[0]:
+            padded_projections[:local_projections.shape[0]] = local_projections
+            padded_positions[:local_positions.shape[0]] = local_positions
+
+        gathered_projections = [torch.empty_like(padded_projections) for _ in range(world_size)]
+        dist.all_gather(gathered_projections, padded_projections.detach().contiguous(), group=process_group)
+        gathered_projections[dist.get_rank(group=process_group)] = padded_projections
+        gathered_positions = [torch.empty_like(padded_positions) for _ in range(world_size)]
+        dist.all_gather(gathered_positions, padded_positions.contiguous(), group=process_group)
+
+        projection_chunks: list[torch.Tensor] = []
+        position_chunks: list[torch.Tensor] = []
+        for projection, position, item_count in zip(gathered_projections, gathered_positions, count_values):
+            if item_count:
+                projection_chunks.append(projection[:item_count])
+                position_chunks.append(position[:item_count])
+        if not projection_chunks:
+            return local_projections[:0]
+
+        all_projections = torch.cat(projection_chunks, dim=0)
+        all_positions = torch.cat(position_chunks, dim=0)
+        order = torch.argsort(all_positions)
+        all_positions = all_positions.index_select(0, order)
+        all_projections = all_projections.index_select(0, order)
+
+        expected_positions = expected_positions.to(device=all_positions.device, dtype=all_positions.dtype)
+        if all_positions.shape != expected_positions.shape or not torch.equal(all_positions, expected_positions):
+            raise RuntimeError(
+                "context parallel masked-token gather did not reconstruct the global mask order: "
+                f"got {all_positions.detach().cpu().tolist()[:16]}, "
+                f"expected {expected_positions.detach().cpu().tolist()[:16]}"
+            )
+        return all_projections
+
     def project_masked_patch_tokens(
         self,
         branch: nn.ModuleDict,
@@ -623,6 +725,41 @@ class DinoVitStudentTeacher(nn.Module):
         mask_indices_list: torch.Tensor,
         n_masked_patches: Optional[int] = None,
     ) -> torch.Tensor:
+        cp_info = self._context_parallel_info(branch)
+        if cp_info is not None:
+            cp_size, start, end, full_tokens, process_group = cp_info
+            expected_positions = mask_indices_list
+            if n_masked_patches is not None:
+                expected_positions = expected_positions[:n_masked_patches]
+            view_indices = torch.div(expected_positions, full_tokens, rounding_mode="floor")
+            patch_indices = expected_positions - (view_indices * full_tokens)
+            local_mask = (patch_indices >= start) & (patch_indices < end)
+            local_positions = expected_positions[local_mask]
+            local_patch_indices = patch_indices[local_mask] - start
+            local_view_indices = view_indices[local_mask]
+            local_tokens_per_view = end - start
+            local_flat_indices = (local_view_indices * local_tokens_per_view + local_patch_indices).to(
+                device=patch_tokens.device,
+                dtype=torch.long,
+            )
+            local_masked_tokens = torch.index_select(
+                patch_tokens.flatten(0, 1),
+                dim=0,
+                index=local_flat_indices,
+            )
+            local_projections = self._apply_head_chunked(
+                branch.ibot_head,
+                local_masked_tokens,
+                self.masked_projection_chunk_size,
+            )
+            return self._gather_context_parallel_masked_projections(
+                local_projections,
+                local_positions.to(device=local_projections.device, dtype=torch.long),
+                expected_positions,
+                process_group=process_group,
+                world_size=cp_size,
+            )
+
         masked_tokens = self.select_masked_patch_tokens(
             patch_tokens,
             mask_indices_list=mask_indices_list,
@@ -653,6 +790,7 @@ class DinoVitStudentTeacher(nn.Module):
         backbone_outputs: Mapping[str, torch.Tensor],
         project_cls_tokens: bool = True,
         project_patch_tokens: bool = False,
+        keep_patch_tokens: bool = True,
     ) -> dict[str, torch.Tensor]:
         cls_tokens = backbone_outputs["x_norm_clstoken"]
         if cls_tokens is None:
@@ -660,13 +798,37 @@ class DinoVitStudentTeacher(nn.Module):
 
         outputs: dict[str, torch.Tensor] = {
             "cls_tokens": cls_tokens,
-            "patch_tokens": backbone_outputs["x_norm_patchtokens"],
         }
+        if keep_patch_tokens:
+            outputs["patch_tokens"] = backbone_outputs["x_norm_patchtokens"]
         if project_cls_tokens:
             outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
             outputs["patch_projections"] = self.project_patch_tokens(branch, backbone_outputs["x_norm_patchtokens"])
         return outputs
+
+    @staticmethod
+    def _concat_branch_outputs(outputs: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+        if not outputs:
+            raise ValueError("cannot concatenate an empty branch-output list")
+        keys = outputs[0].keys()
+        return {
+            key: torch.cat([output[key] for output in outputs], dim=0)
+            for key in keys
+        }
+
+    def _split_views(
+        self,
+        x: torch.Tensor,
+        masks: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor | list[torch.Tensor], Optional[torch.Tensor] | list[Optional[torch.Tensor]]]:
+        chunk_size = self.view_chunk_size
+        if chunk_size is None or x.shape[0] <= chunk_size:
+            return x, masks
+        x_chunks = list(x.split(chunk_size, dim=0))
+        if masks is None:
+            return x_chunks, [None for _ in x_chunks]
+        return x_chunks, list(masks.split(chunk_size, dim=0))
 
     def _forward_branch(
         self,
@@ -677,23 +839,28 @@ class DinoVitStudentTeacher(nn.Module):
         project_patch_tokens: bool = False,
         *,
         view_kind: str = "global",
+        keep_patch_tokens: bool = True,
     ) -> Mapping[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
+        x, masks = self._split_views(x, masks)
         backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training, view_kind=view_kind)
         if isinstance(backbone_outputs, list):
-            return [
+            formatted_outputs = [
                 self._format_branch_outputs(
                     branch,
                     output,
                     project_cls_tokens=project_cls_tokens,
                     project_patch_tokens=project_patch_tokens,
+                    keep_patch_tokens=keep_patch_tokens,
                 )
                 for output in backbone_outputs
             ]
+            return self._concat_branch_outputs(formatted_outputs)
         return self._format_branch_outputs(
             branch,
             backbone_outputs,
             project_cls_tokens=project_cls_tokens,
             project_patch_tokens=project_patch_tokens,
+            keep_patch_tokens=keep_patch_tokens,
         )
 
     def forward(
@@ -709,7 +876,55 @@ class DinoVitStudentTeacher(nn.Module):
         return_teacher: bool = True,
         project_student_patch_tokens: bool = False,
         project_teacher_patch_tokens: bool = False,
+        local_only: bool = False,
+        teacher_only: bool = False,
     ) -> dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]]:
+        if local_only:
+            local_source = local_student_input if local_student_input is not None else student_input
+            return {
+                "student": {
+                    "local": self._forward_branch(
+                        self.student,
+                        local_source,
+                        masks=None,
+                        project_cls_tokens=True,
+                        view_kind="local",
+                        keep_patch_tokens=not self.discard_local_patch_tokens,
+                    )
+                }
+            }
+
+        if teacher_only:
+            project_cls_tokens = mask_indices_list is None
+            teacher_source = student_input if teacher_input is None else teacher_input
+            with torch.no_grad():
+                teacher_outputs = self._forward_branch(
+                    self.teacher,
+                    teacher_source,
+                    masks=teacher_masks if teacher_masks is not None else student_masks,
+                    project_cls_tokens=project_cls_tokens,
+                    project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
+                    view_kind="global",
+                )
+                if mask_indices_list is None:
+                    return {"teacher": teacher_outputs}
+
+                teacher_global = dict(teacher_outputs)
+                teacher_global_cls, teacher_patch = self.project_global_cls_and_masked_patch_tokens(
+                    self.teacher,
+                    teacher_global["cls_tokens"],
+                    teacher_global["patch_tokens"],
+                    mask_indices_list,
+                    n_masked_patches=n_masked_patches,
+                )
+                return {
+                    "teacher": {
+                        "global": teacher_global,
+                        "global_cls_projections": teacher_global_cls,
+                        "global_masked_patch_projections": teacher_patch,
+                    }
+                }
+
         project_cls_tokens = mask_indices_list is None
         student_outputs = self._forward_branch(
             self.student,
@@ -744,6 +959,7 @@ class DinoVitStudentTeacher(nn.Module):
                     masks=None,
                     project_cls_tokens=True,
                     view_kind="local",
+                    keep_patch_tokens=not self.discard_local_patch_tokens,
                 )
             outputs = {"student": structured_student_outputs}
 
@@ -789,6 +1005,24 @@ class DinoVitStudentTeacher(nn.Module):
             set_tensor_parallel = getattr(backbone, "set_tensor_parallel", None)
             if callable(set_tensor_parallel):
                 set_tensor_parallel(
+                    process_group=process_group,
+                    ranks=ranks,
+                    rank=rank,
+                    world_size=world_size,
+                )
+
+    def set_context_parallel(
+        self,
+        *,
+        process_group=None,
+        ranks: tuple[int, ...] | None = None,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        for backbone in (self.student.backbone, self.teacher.backbone):
+            set_context_parallel = getattr(backbone, "set_context_parallel", None)
+            if callable(set_context_parallel):
+                set_context_parallel(
                     process_group=process_group,
                     ranks=ranks,
                     rank=rank,

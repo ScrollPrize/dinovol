@@ -1,0 +1,88 @@
+{
+  "output_dir": "${OUTPUT_DIR}",
+  "device": "cuda",
+  "resume": false,
+  "auto_resume": false,
+  "wandb_project": null,
+  "lr": 1e-4,
+  "min_lr": 1e-6,
+  "weight_decay": 0.04,
+  "weight_decay_end": 0.2,
+  "warmup_steps": 0,
+  "warmup_teacher_temp_steps": 0,
+  "clip_grad": 3.0,
+  "max_iterations": 2,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "use_amp": true,
+  "amp_dtype": "bf16",
+  "centering": "sinkhorn_knopp",
+  "num_local_crops": 2,
+  "view_chunk_size": 1,
+  "discard_local_patch_tokens": true,
+  "dataloader-workers": 0,
+  "distributed_timeout_seconds": 1800,
+  "parallelism": {
+    "strategy": "mesh",
+    "tensor_parallel_size": 4,
+    "context_parallel_size": 2,
+    "sharding": "none"
+  },
+  "koleo": {
+    "distributed": true
+  },
+  "ibot": {
+    "max_masked_patches_per_rank": 2048,
+    "projection_chunk_size": 512,
+    "loss_chunk_size": 512
+  },
+  "model": {
+    "model_type": "v2",
+    "input_channels": 1,
+    "embedding_type": "default",
+    "global_crops_size": [256, 256, 256],
+    "local_crops_size": [128, 128, 128],
+    "patch_size": [4, 4, 4],
+    "embed_dim": 96,
+    "depth": 2,
+    "num_heads": 8,
+    "num_reg_tokens": 2,
+    "dino_out_dim": 128,
+    "ibot_out_dim": 128,
+    "dino_head_hidden_dim": 128,
+    "dino_head_bottleneck_dim": 96,
+    "ibot_head_hidden_dim": 128,
+    "ibot_head_bottleneck_dim": 96,
+    "use_abs_pos_emb": false,
+    "use_rot_pos_emb": true,
+    "rope_type": "mixed",
+    "rope_base": 100.0,
+    "rope_normalize_coords": "separate",
+    "rope_rescale_coords": 2.0,
+    "rope_shift_coords": 0.05,
+    "rope_jitter_coords": 1.05,
+    "attention_mode": "window_global_3d",
+    "window_size_patches": [8, 8, 8],
+    "shift_size_patches": [4, 4, 4],
+    "alternate_window_shift": true,
+    "mlp_token_chunk_size": 8192,
+    "block_chunks": 1,
+    "grad_checkpointing": true
+  },
+  "dataset": {
+    "epoch_length": 32,
+    "vol_trim_pct": 1.0,
+    "global_crop_size": [256, 256, 256],
+    "local_crop_size": [128, 128, 128],
+    "global_crop_scale": [0.5, 1.0],
+    "local_crop_scale": [0.5, 1.0],
+    "num_local_crops": 2,
+    "source_sampling_size": [288, 288, 288],
+    "datasets": [
+      {
+        "volume_path": "${SYNTHETIC_ZARR}",
+        "volume_scale": 0
+      }
+    ]
+  }
+}

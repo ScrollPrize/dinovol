@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import timedelta
 import json
@@ -12,6 +13,17 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointImpl, checkpoint_wrapper
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
@@ -129,14 +141,22 @@ class DinoIBOTPretrainer:
         self.local_rank = int(distributed_config["local_rank"])
         self.world_size = int(distributed_config["world_size"])
         self.parallelism_strategy = str(distributed_config.get("strategy", "ddp"))
+        self.parallelism_sharding = str(distributed_config.get("sharding", "none"))
+        self.model_parallel_size = int(distributed_config.get("model_parallel_size", 1))
         self.tensor_parallel_size = int(distributed_config.get("tensor_parallel_size", 1))
+        self.context_parallel_size = int(distributed_config.get("context_parallel_size", 1))
         self.tensor_parallel_rank = int(distributed_config.get("tensor_parallel_rank", 0))
+        self.context_parallel_rank = int(distributed_config.get("context_parallel_rank", 0))
         self.data_parallel_world_size = int(distributed_config.get("data_parallel_world_size", self.world_size))
         self.data_parallel_rank = int(distributed_config.get("data_parallel_rank", self.rank))
         self.tensor_parallel_group = None
         self.tensor_parallel_ranks: tuple[int, ...] = (self.rank,)
+        self.context_parallel_group = None
+        self.context_parallel_ranks: tuple[int, ...] = (self.rank,)
         self.data_parallel_group = None
         self.data_parallel_ranks: tuple[int, ...] = tuple(range(self.world_size)) if self.is_distributed else (0,)
+        self.data_parallel_mesh: DeviceMesh | None = None
+        self._fsdp_replicated_param_sync_handles: list[Any] = []
 
         configured_device_name = self.config.get("device")
         configured_device = torch.device(configured_device_name) if configured_device_name is not None else None
@@ -178,20 +198,31 @@ class DinoIBOTPretrainer:
                 world_size=self.world_size,
                 rank=self.rank,
                 tensor_parallel_size=self.tensor_parallel_size,
+                context_parallel_size=self.context_parallel_size,
             )
             self.tensor_parallel_group = parallel_groups["tensor_parallel_group"]
             self.tensor_parallel_ranks = tuple(int(rank) for rank in parallel_groups["tensor_parallel_ranks"])
+            self.context_parallel_group = parallel_groups["context_parallel_group"]
+            self.context_parallel_ranks = tuple(int(rank) for rank in parallel_groups["context_parallel_ranks"])
             self.data_parallel_group = parallel_groups["data_parallel_group"]
             self.data_parallel_ranks = tuple(int(rank) for rank in parallel_groups["data_parallel_ranks"])
             self.tensor_parallel_rank = self.tensor_parallel_ranks.index(self.rank)
+            self.context_parallel_rank = self.context_parallel_ranks.index(self.rank)
             self.data_parallel_rank = self.data_parallel_ranks.index(self.rank)
             self.data_parallel_world_size = len(self.data_parallel_ranks)
+            if self.parallelism_sharding == "fsdp2":
+                self.data_parallel_mesh = DeviceMesh(
+                    self.device.type,
+                    list(self.data_parallel_ranks),
+                    mesh_dim_names=("dp",),
+                )
 
         if self.is_distributed and self.is_main_process:
             print(
                 "distributed="
                 f"{self.is_distributed} strategy={self.parallelism_strategy} world={self.world_size} "
-                f"dp={self.data_parallel_world_size} tp={self.tensor_parallel_size} device={self.device}"
+                f"dp={self.data_parallel_world_size} cp={self.context_parallel_size} "
+                f"tp={self.tensor_parallel_size} sharding={self.parallelism_sharding} device={self.device}"
             )
 
         self.amp_dtype = self._resolve_amp_dtype(self.config.get("amp_dtype", "auto"))
@@ -204,6 +235,26 @@ class DinoIBOTPretrainer:
         self.final_weight_decay = float(self.config.get("weight_decay_end", 0.4))
         self.betas = tuple(self.config.get("betas", (0.9, 0.999)))
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
+        self.gradient_accumulation_steps = max(
+            1,
+            int(
+                self.config.get(
+                    "gradient_accumulation_steps",
+                    self.config.get("grad_accumulation_steps", self.config.get("accumulation_steps", 1)),
+                )
+            ),
+        )
+        self.low_memory_local_crops = bool(self.config.get("low_memory_local_crops", False))
+        self.low_memory_global_crops = bool(self.config.get("low_memory_global_crops", False))
+        self.local_loss_chunk_size = max(
+            1,
+            int(
+                self.config.get(
+                    "local_loss_chunk_size",
+                    self.config.get("view_chunk_size", 1),
+                )
+            ),
+        )
         self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
         self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 0.2))
         self.ibot_config = dict(self.config.get("ibot") or {})
@@ -221,6 +272,8 @@ class DinoIBOTPretrainer:
         self.warmup_steps = int(self.config["warmup_steps"]) if "warmup_steps" in self.config else default_warmup_steps
         self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()
 
+        self.seed = int(self.config.get("seed", 0))
+        self._seed_model_initialization()
         self.model = DinoVitStudentTeacher(self.model_config).to(self.device)
         if self.tensor_parallel_size > 1:
             self.model.set_tensor_parallel(
@@ -229,12 +282,26 @@ class DinoIBOTPretrainer:
                 rank=self.tensor_parallel_rank,
                 world_size=self.tensor_parallel_size,
             )
+        if self.context_parallel_size > 1:
+            self.model.set_context_parallel(
+                process_group=self.context_parallel_group,
+                ranks=self.context_parallel_ranks,
+                rank=self.context_parallel_rank,
+                world_size=self.context_parallel_size,
+            )
         self._configure_deeper_embed_overscan()
+        self._prepare_fsdp_activation_checkpointing()
+        self._apply_sharding_if_configured()
         self.optimizer = self._build_optimizer()
-        if self.is_distributed:
+        if self.is_distributed and self.parallelism_sharding != "fsdp2":
             ddp_kwargs: dict[str, Any] = {
                 "broadcast_buffers": False,
-                "find_unused_parameters": False,
+                "find_unused_parameters": bool(
+                    self.config.get(
+                        "ddp_find_unused_parameters",
+                        self.low_memory_global_crops or self.low_memory_local_crops,
+                    )
+                ),
             }
             if self.device.type == "cuda":
                 ddp_kwargs.update(
@@ -531,11 +598,164 @@ class DinoIBOTPretrainer:
             lr_decay_rate=self.layer_decay,
             patch_embed_lr_mult=self.patch_embed_lr_mult,
         )
+        if self.parallelism_sharding == "zero1":
+            if not self.is_distributed:
+                raise ValueError("ZeRO-1 requires torchrun/DDP.")
+            return ZeroRedundancyOptimizer(
+                param_groups,
+                optimizer_class=torch.optim.AdamW,
+                process_group=self.data_parallel_group,
+                lr=self.base_lr,
+                betas=self.betas,
+            )
+        optimizer_kwargs: dict[str, Any] = {}
+        if self.parallelism_sharding == "fsdp2":
+            optimizer_kwargs["foreach"] = False
         return torch.optim.AdamW(
             param_groups,
             lr=self.base_lr,
             betas=self.betas,
+            **optimizer_kwargs,
         )
+
+    def _fsdp_mp_policy(self) -> MixedPrecisionPolicy:
+        reduce_dtype = self.amp_dtype if self.amp_dtype in {torch.bfloat16, torch.float16} else None
+        return MixedPrecisionPolicy(param_dtype=None, reduce_dtype=reduce_dtype, output_dtype=None)
+
+    def _context_parallel_replicated_loss_scale(self) -> float:
+        return 1.0 / float(self.context_parallel_size) if self.context_parallel_size > 1 else 1.0
+
+    def _prepare_fsdp_activation_checkpointing(self) -> None:
+        if self.parallelism_sharding != "fsdp2":
+            return
+
+        def wrap_backbone(backbone: torch.nn.Module) -> None:
+            if not bool(getattr(backbone, "grad_checkpointing", False)):
+                return
+            blocks = getattr(backbone, "blocks", None)
+            if blocks is None:
+                return
+            for block_index, block in enumerate(blocks):
+                if isinstance(block, torch.nn.ModuleList):
+                    for sub_index, sub_block in enumerate(block):
+                        block[sub_index] = checkpoint_wrapper(
+                            sub_block,
+                            checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                        )
+                else:
+                    blocks[block_index] = checkpoint_wrapper(
+                        block,
+                        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                    )
+            backbone.grad_checkpointing = False
+
+        for branch_name in ("student", "teacher"):
+            branch = getattr(self.model, branch_name)
+            wrap_backbone(branch.backbone)
+
+    def _seed_model_initialization(self) -> None:
+        random.seed(self.seed)
+        np.random.seed(self.seed % (2 ** 32))
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
+
+    def _collect_fsdp_replicated_parameters(self) -> set[torch.nn.Parameter]:
+        replicated: set[torch.nn.Parameter] = set()
+        for module in self.model.modules():
+            rope_embed = getattr(module, "rope_embed", None)
+            mix_frequencies = getattr(rope_embed, "mix_frequencies", None)
+            if isinstance(mix_frequencies, torch.nn.Parameter):
+                replicated.add(mix_frequencies)
+        return replicated
+
+    def _sync_replicated_parameter_data(self, parameters: set[torch.nn.Parameter]) -> None:
+        if not parameters or self.data_parallel_group is None:
+            return
+        source_rank = self.data_parallel_ranks[0]
+        for parameter in parameters:
+            dist.broadcast(parameter.data, src=source_rank, group=self.data_parallel_group)
+
+    def _register_replicated_parameter_gradient_sync(self, parameters: set[torch.nn.Parameter]) -> None:
+        if not parameters or self.data_parallel_group is None:
+            return
+        world_size = float(self.data_parallel_world_size)
+        group = self.data_parallel_group
+
+        def make_hook() -> Any:
+            def hook(grad: torch.Tensor) -> torch.Tensor:
+                synced_grad = grad.contiguous()
+                dist.all_reduce(synced_grad, op=dist.ReduceOp.SUM, group=group)
+                synced_grad.div_(world_size)
+                return synced_grad
+
+            return hook
+
+        for parameter in parameters:
+            if parameter.requires_grad:
+                self._fsdp_replicated_param_sync_handles.append(parameter.register_hook(make_hook()))
+
+    def _apply_sharding_if_configured(self) -> None:
+        if self.parallelism_sharding in {"none", "zero1"}:
+            return
+        if self.parallelism_sharding != "fsdp2":
+            raise ValueError(f"unsupported sharding mode: {self.parallelism_sharding}")
+        if not self.is_distributed:
+            raise ValueError("FSDP2 sharding requires torchrun/DDP.")
+        if self.data_parallel_world_size < 2:
+            raise ValueError("FSDP2 sharding requires at least two data-parallel ranks.")
+        if self.data_parallel_mesh is None:
+            raise RuntimeError("data-parallel DeviceMesh was not initialized.")
+
+        mp_policy = self._fsdp_mp_policy()
+        replicated_params = self._collect_fsdp_replicated_parameters()
+        self._sync_replicated_parameter_data(replicated_params)
+
+        def ignored_params_for(module: torch.nn.Module) -> set[torch.nn.Parameter] | None:
+            if not replicated_params:
+                return None
+            module_params = set(module.parameters(recurse=True))
+            ignored = replicated_params.intersection(module_params)
+            return ignored or None
+
+        def shard_backbone(backbone: torch.nn.Module) -> None:
+            blocks = getattr(backbone, "blocks", None)
+            if blocks is not None:
+                for block in blocks:
+                    if isinstance(block, torch.nn.ModuleList):
+                        for sub_block in block:
+                            fully_shard(
+                                sub_block,
+                                mesh=self.data_parallel_mesh,
+                                mp_policy=mp_policy,
+                                ignored_params=ignored_params_for(sub_block),
+                            )
+                    else:
+                        fully_shard(
+                            block,
+                            mesh=self.data_parallel_mesh,
+                            mp_policy=mp_policy,
+                            ignored_params=ignored_params_for(block),
+                        )
+            fully_shard(backbone, mesh=self.data_parallel_mesh, mp_policy=mp_policy, ignored_params=ignored_params_for(backbone))
+
+        for branch_name in ("student", "teacher"):
+            branch = getattr(self.model, branch_name)
+            shard_backbone(branch.backbone)
+            fully_shard(
+                branch.dino_head,
+                mesh=self.data_parallel_mesh,
+                mp_policy=mp_policy,
+                ignored_params=ignored_params_for(branch.dino_head),
+            )
+            fully_shard(
+                branch.ibot_head,
+                mesh=self.data_parallel_mesh,
+                mp_policy=mp_policy,
+                ignored_params=ignored_params_for(branch.ibot_head),
+            )
+        fully_shard(self.model, mesh=self.data_parallel_mesh, mp_policy=mp_policy, ignored_params=ignored_params_for(self.model))
+        self._register_replicated_parameter_gradient_sync(replicated_params)
     
     def _build_schedulers(self) -> tuple[
         CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler]:
@@ -1481,121 +1701,348 @@ class DinoIBOTPretrainer:
             },
         }
     
-    def train_step(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
+    def _backward_low_memory_micro_step(
+        self,
+        *,
+        global_crops: torch.Tensor,
+        local_crops: torch.Tensor,
+        gram_teacher_crops: torch.Tensor | None,
+        masks: torch.Tensor,
+        mask_indices: torch.Tensor,
+        masks_weight: torch.Tensor,
+        n_global_views: int,
+        n_local_views: int,
+        n_masked: int,
+        teacher_temp: float,
+        accumulation_steps: int,
+    ) -> dict[str, float]:
+        if n_global_views != 2 or global_crops.shape[0] != 2:
+            raise ValueError("low_memory_global_crops currently requires exactly two global views and batch_size=1.")
+        if self.do_gram:
+            raise ValueError("low_memory_global_crops does not support Gram loss yet.")
+
+        tokens_per_view = masks.shape[1]
+        total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
+        cp_replicated_loss_scale = self._context_parallel_replicated_loss_scale()
+
+        with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+            with torch.no_grad():
+                teacher_outputs = self.model(
+                    global_crops,
+                    student_masks=masks,
+                    mask_indices_list=mask_indices,
+                    n_masked_patches=n_masked,
+                    return_teacher=True,
+                    teacher_only=True,
+                )
+                teacher_branch = teacher_outputs["teacher"]
+                teacher_cls_proj = teacher_branch["global_cls_projections"]
+                teacher_patch = teacher_branch["global_masked_patch_projections"]
+                if self.do_dino:
+                    teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(teacher_cls_proj, teacher_temp)
+                    teacher_cls_targets = [teacher_cls_0.detach(), teacher_cls_1.detach()]
+                else:
+                    teacher_cls_targets = [None, None]
+                teacher_patch_targets = (
+                    self._center_teacher_patch(teacher_patch, teacher_temp).detach()
+                    if self.do_ibot and n_masked > 0
+                    else None
+                )
+
+        dino_global_loss_sum = global_crops.new_zeros(())
+        ibot_loss_sum = global_crops.new_zeros(())
+        koleo_loss_sum = global_crops.new_zeros(())
+        global_loss_sum = global_crops.new_zeros(())
+
+        for view_idx in range(n_global_views):
+            start = view_idx * tokens_per_view
+            end = start + tokens_per_view
+            selected_positions = ((mask_indices >= start) & (mask_indices < end)).nonzero().flatten()
+            view_mask_indices = mask_indices.index_select(0, selected_positions) - start
+            view_n_masked = int(view_mask_indices.numel())
+            view_masks_weight = masks_weight.index_select(0, selected_positions) if view_n_masked else masks_weight[:0]
+            view_teacher_patch = (
+                teacher_patch_targets.index_select(0, selected_positions)
+                if teacher_patch_targets is not None and view_n_masked
+                else None
+            )
+
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                student_outputs = self.model(
+                    global_crops[view_idx:view_idx + 1],
+                    student_masks=masks[view_idx:view_idx + 1],
+                    mask_indices_list=view_mask_indices,
+                    n_masked_patches=view_n_masked,
+                    return_teacher=False,
+                )
+                student_branch = student_outputs["student"]
+                student_global = student_branch["global"]
+                student_cls = student_branch["global_cls_projections"]
+                student_patch = student_branch["global_masked_patch_projections"]
+
+                if self.do_dino:
+                    target = teacher_cls_targets[1 - view_idx]
+                    dino_global_loss = (
+                        self.dino_loss([student_cls], [target]) / total_terms
+                    ) * cp_replicated_loss_scale
+                else:
+                    dino_global_loss = global_crops.new_zeros(())
+
+                if self.do_ibot and view_n_masked > 0 and view_teacher_patch is not None:
+                    ibot_loss = self.ibot_patch_loss.forward_masked(
+                        student_patch,
+                        view_teacher_patch,
+                        student_masks_flat=masks[view_idx:view_idx + 1],
+                        n_masked_patches=view_n_masked,
+                        masks_weight=view_masks_weight,
+                    )
+                    ibot_loss = ibot_loss * (global_crops.shape[0] ** -1)
+                else:
+                    ibot_loss = global_crops.new_zeros(())
+
+                if self.do_koleo:
+                    koleo_loss = self.koleo_loss(student_global["cls_tokens"]) * cp_replicated_loss_scale
+                else:
+                    koleo_loss = global_crops.new_zeros(())
+
+                view_loss = (
+                    self.dino_loss_weight * dino_global_loss +
+                    self.ibot_loss_weight * ibot_loss +
+                    self.koleo_loss_weight * koleo_loss
+                )
+                self.scaler.scale(view_loss / accumulation_steps).backward()
+
+            dino_global_loss_sum = dino_global_loss_sum + dino_global_loss.detach()
+            ibot_loss_sum = ibot_loss_sum + ibot_loss.detach()
+            koleo_loss_sum = koleo_loss_sum + koleo_loss.detach()
+            global_loss_sum = global_loss_sum + view_loss.detach()
+            del student_outputs, student_branch, student_global, student_cls, student_patch
+
+        dino_local_loss_sum = global_crops.new_zeros(())
+        if n_local_views and self.do_dino:
+            for local_chunk in local_crops.split(self.local_loss_chunk_size, dim=0):
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                    local_outputs = self.model(
+                        local_chunk,
+                        return_teacher=False,
+                        local_only=True,
+                    )
+                    local_student = local_outputs["student"]["local"]
+                    local_cls_chunks = list(local_student["cls_projections"].chunk(local_chunk.shape[0]))
+                    local_loss = (
+                        self.dino_loss(local_cls_chunks, teacher_cls_targets) / total_terms
+                    ) * cp_replicated_loss_scale
+                    self.scaler.scale(self.dino_loss_weight * local_loss / accumulation_steps).backward()
+                dino_local_loss_sum = dino_local_loss_sum + local_loss.detach()
+                del local_outputs, local_student, local_cls_chunks, local_loss
+
+        total_loss = global_loss_sum + self.dino_loss_weight * dino_local_loss_sum
+        return {
+            "loss": float(total_loss.detach()),
+            "dino_global_loss": float(dino_global_loss_sum.detach()),
+            "dino_local_loss": float(dino_local_loss_sum.detach()),
+            "ibot_loss": float(ibot_loss_sum.detach()),
+            "koleo_loss": float(koleo_loss_sum.detach()),
+            "gram_loss": 0.0,
+        }
+
+    def train_step(self, batch: Mapping[str, Any] | list[Mapping[str, Any]], step: int) -> dict[str, float]:
         self.model.train()
         lr, weight_decay, teacher_momentum, teacher_temp = self._apply_optim_scheduler(step)
-
-        global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
-        local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
-        gram_teacher_crops = batch.get("collated_gram_teacher_crops")
-        if gram_teacher_crops is not None:
-            gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
-        masks = batch["collated_masks"].to(self.device, non_blocking=True)
-        mask_indices = batch["mask_indices_list"].to(self.device, non_blocking=True)
-        masks_weight = batch["masks_weight"].to(self.device, non_blocking=True)
-        n_global_views = int(batch["n_global_views"])
-        n_local_views = int(batch["n_local_views"])
-        n_masked = int(batch["n_masked_patches"].item())
+        batches = list(batch) if isinstance(batch, list) else [batch]
+        accumulation_steps = max(1, len(batches))
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
-            model_outputs = self._forward_model(
-                global_crops=global_crops,
-                local_crops=local_crops if n_local_views else None,
-                masks=masks,
-                mask_indices=mask_indices,
-                n_masked=n_masked,
-                return_teacher=self.do_dino or self.do_ibot,
+        metric_sums = {
+            "loss": 0.0,
+            "dino_global_loss": 0.0,
+            "dino_local_loss": 0.0,
+            "ibot_loss": 0.0,
+            "koleo_loss": 0.0,
+            "gram_loss": 0.0,
+        }
+
+        for micro_step, micro_batch in enumerate(batches):
+            global_crops = micro_batch["collated_global_crops"].to(self.device, non_blocking=True)
+            local_crops = micro_batch["collated_local_crops"].to(self.device, non_blocking=True)
+            gram_teacher_crops = micro_batch.get("collated_gram_teacher_crops")
+            if gram_teacher_crops is not None:
+                gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
+            masks = micro_batch["collated_masks"].to(self.device, non_blocking=True)
+            mask_indices = micro_batch["mask_indices_list"].to(self.device, non_blocking=True)
+            masks_weight = micro_batch["masks_weight"].to(self.device, non_blocking=True)
+            n_global_views = int(micro_batch["n_global_views"])
+            n_local_views = int(micro_batch["n_local_views"])
+            n_masked = int(micro_batch["n_masked_patches"].item())
+
+            should_sync = micro_step == accumulation_steps - 1
+            sync_context = (
+                self.model.no_sync()
+                if isinstance(self.model, DDP) and not should_sync
+                else nullcontext()
             )
-            teacher_branch = model_outputs.get("teacher")
-            if self.do_dino and teacher_branch is not None:
-                teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
-                    teacher_branch["global_cls_projections"],
-                    teacher_temp,
-                )
-            else:
-                teacher_cls_0 = teacher_cls_1 = None
-            if self.do_ibot and teacher_branch is not None:
-                teacher_patch_targets = self._center_teacher_patch(
-                    teacher_branch["global_masked_patch_projections"],
-                    teacher_temp,
-                )
-            else:
-                teacher_patch_targets = None
+            with sync_context:
+                if self.low_memory_global_crops:
+                    micro_metrics = self._backward_low_memory_micro_step(
+                        global_crops=global_crops,
+                        local_crops=local_crops,
+                        gram_teacher_crops=gram_teacher_crops,
+                        masks=masks,
+                        mask_indices=mask_indices,
+                        masks_weight=masks_weight,
+                        n_global_views=n_global_views,
+                        n_local_views=n_local_views,
+                        n_masked=n_masked,
+                        teacher_temp=teacher_temp,
+                        accumulation_steps=accumulation_steps,
+                    )
+                    for key in metric_sums:
+                        metric_sums[key] += micro_metrics[key]
+                    continue
 
-            student_branch = model_outputs["student"]
-            student_global = student_branch["global"]
-            student_global_cls = student_branch["global_cls_projections"]
-            student_patch = student_branch["global_masked_patch_projections"]
-            global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
+                with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                    low_memory_local = bool(self.low_memory_local_crops and n_local_views and self.do_dino)
+                    model_outputs = self._forward_model(
+                        global_crops=global_crops,
+                        local_crops=None if low_memory_local else (local_crops if n_local_views else None),
+                        masks=masks,
+                        mask_indices=mask_indices,
+                        n_masked=n_masked,
+                        return_teacher=self.do_dino or self.do_ibot,
+                    )
+                    teacher_branch = model_outputs.get("teacher")
+                    if self.do_dino and teacher_branch is not None:
+                        teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
+                            teacher_branch["global_cls_projections"],
+                            teacher_temp,
+                        )
+                    else:
+                        teacher_cls_0 = teacher_cls_1 = None
+                    if self.do_ibot and teacher_branch is not None:
+                        teacher_patch_targets = self._center_teacher_patch(
+                            teacher_branch["global_masked_patch_projections"],
+                            teacher_temp,
+                        )
+                    else:
+                        teacher_patch_targets = None
 
-            total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
-            if self.do_dino:
-                dino_global_loss = (
-                    self.dino_loss([global_cls_0], [teacher_cls_1]) +
-                    self.dino_loss([global_cls_1], [teacher_cls_0])
-                ) / total_terms
+                    student_branch = model_outputs["student"]
+                    student_global = student_branch["global"]
+                    student_global_cls = student_branch["global_cls_projections"]
+                    student_patch = student_branch["global_masked_patch_projections"]
+                    global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
 
-                if n_local_views:
-                    student_local = student_branch["local"]
-                    local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
-                    dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
-                else:
-                    dino_local_loss = global_crops.new_zeros(())
-            else:
-                dino_global_loss = global_crops.new_zeros(())
-                dino_local_loss = global_crops.new_zeros(())
+                    total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
+                    cp_replicated_loss_scale = self._context_parallel_replicated_loss_scale()
+                    if self.do_dino:
+                        dino_global_loss = (
+                            self.dino_loss([global_cls_0], [teacher_cls_1]) +
+                            self.dino_loss([global_cls_1], [teacher_cls_0])
+                        ) / total_terms
+                        dino_global_loss = dino_global_loss * cp_replicated_loss_scale
 
-            if self.do_ibot and n_masked > 0:
-                ibot_loss = self.ibot_patch_loss.forward_masked(
-                    student_patch,
-                    teacher_patch_targets,
-                    student_masks_flat=masks,
-                    n_masked_patches=n_masked,
-                    masks_weight=masks_weight,
-                )
-            else:
-                ibot_loss = global_crops.new_zeros(())
+                        if n_local_views and not low_memory_local:
+                            student_local = student_branch["local"]
+                            local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
+                            dino_local_loss = (
+                                self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
+                            ) * cp_replicated_loss_scale
+                        else:
+                            dino_local_loss = global_crops.new_zeros(())
+                    else:
+                        dino_global_loss = global_crops.new_zeros(())
+                        dino_local_loss = global_crops.new_zeros(())
 
-            if self.do_koleo:
-                koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(n_global_views))
-            else:
-                koleo_loss = global_crops.new_zeros(())
-            gram_loss, _, _ = self._compute_gram_loss(
-                student_patch_tokens=student_global["patch_tokens"],
-                global_crops=global_crops,
-                gram_teacher_crops=gram_teacher_crops,
-            )
+                    if self.do_ibot and n_masked > 0:
+                        ibot_loss = self.ibot_patch_loss.forward_masked(
+                            student_patch,
+                            teacher_patch_targets,
+                            student_masks_flat=masks,
+                            n_masked_patches=n_masked,
+                            masks_weight=masks_weight,
+                        )
+                    else:
+                        ibot_loss = global_crops.new_zeros(())
 
-            loss = (
-                self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
-                self.ibot_loss_weight * ibot_loss +
-                self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
-            )
+                    if self.do_koleo:
+                        koleo_loss = (
+                            sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(n_global_views))
+                            * cp_replicated_loss_scale
+                        )
+                    else:
+                        koleo_loss = global_crops.new_zeros(())
+                    gram_loss, _, _ = self._compute_gram_loss(
+                        student_patch_tokens=student_global["patch_tokens"],
+                        global_crops=global_crops,
+                        gram_teacher_crops=gram_teacher_crops,
+                    )
+                    gram_loss = gram_loss * cp_replicated_loss_scale
 
-        self.scaler.scale(loss).backward()
+                    loss = (
+                        self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
+                        self.ibot_loss_weight * ibot_loss +
+                        self.koleo_loss_weight * koleo_loss +
+                        self.gram_loss_weight * gram_loss
+                    )
+                    scaled_loss = loss / accumulation_steps
+
+                self.scaler.scale(scaled_loss).backward()
+
+                if low_memory_local:
+                    if teacher_cls_0 is None or teacher_cls_1 is None:
+                        raise RuntimeError("low_memory_local_crops requires DINO teacher targets.")
+                    teacher_targets = [teacher_cls_0.detach(), teacher_cls_1.detach()]
+                    del model_outputs, student_branch, student_global, student_global_cls, student_patch
+                    local_loss_sum = global_crops.new_zeros(())
+                    for local_chunk in local_crops.split(self.local_loss_chunk_size, dim=0):
+                        with torch.autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.amp_dtype):
+                            local_outputs = self.model(
+                                local_chunk,
+                                return_teacher=False,
+                                local_only=True,
+                            )
+                            local_student = local_outputs["student"]["local"]
+                            local_cls_chunks = list(local_student["cls_projections"].chunk(local_chunk.shape[0]))
+                            local_loss = (
+                                self.dino_loss(local_cls_chunks, teacher_targets) / total_terms
+                            ) * cp_replicated_loss_scale
+                            scaled_local_loss = self.dino_loss_weight * local_loss / accumulation_steps
+                        self.scaler.scale(scaled_local_loss).backward()
+                        local_loss_sum = local_loss_sum + local_loss.detach()
+                        del local_outputs, local_student, local_cls_chunks, local_loss, scaled_local_loss
+                    dino_local_loss = local_loss_sum
+                    loss = loss.detach() + self.dino_loss_weight * dino_local_loss
+
+            metric_sums["loss"] += float(loss.detach())
+            metric_sums["dino_global_loss"] += float(dino_global_loss.detach())
+            metric_sums["dino_local_loss"] += float(dino_local_loss.detach())
+            metric_sums["ibot_loss"] += float(ibot_loss.detach())
+            metric_sums["koleo_loss"] += float(koleo_loss.detach())
+            metric_sums["gram_loss"] += float(gram_loss.detach())
+
         self.scaler.unscale_(self.optimizer)
-        clip_grad_norm_(self.model_module.student.parameters(), self.clip_grad)
+        self._sync_context_parallel_gradients()
+        self._clip_student_gradients()
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        if self.tensor_parallel_size > 1:
+        if self.tensor_parallel_size > 1 and self.parallelism_sharding != "fsdp2":
             self.model_module.sync_tensor_parallel_parameters(optimizer=self.optimizer)
         self.model_module.update_teacher(teacher_momentum)
         self._maybe_refresh_gram_teacher(step)
 
         return {
-            "loss": float(loss.detach()),
-            "dino_global_loss": float(dino_global_loss.detach()),
-            "dino_local_loss": float(dino_local_loss.detach()),
-            "ibot_loss": float(ibot_loss.detach()),
-            "koleo_loss": float(koleo_loss.detach()),
-            "gram_loss": float(gram_loss.detach()),
+            "loss": metric_sums["loss"] / accumulation_steps,
+            "dino_global_loss": metric_sums["dino_global_loss"] / accumulation_steps,
+            "dino_local_loss": metric_sums["dino_local_loss"] / accumulation_steps,
+            "ibot_loss": metric_sums["ibot_loss"] / accumulation_steps,
+            "koleo_loss": metric_sums["koleo_loss"] / accumulation_steps,
+            "gram_loss": metric_sums["gram_loss"] / accumulation_steps,
             "gram_loss_weight": float(self.gram_loss_weight),
             "lr": lr,
             "weight_decay": weight_decay,
             "teacher_temp": teacher_temp,
+            "gradient_accumulation_steps": float(accumulation_steps),
         }
     
     @staticmethod
@@ -1625,36 +2072,160 @@ class DinoIBOTPretrainer:
             for key, value in optimizer_state.items():
                 if torch.is_tensor(value):
                     optimizer_state[key] = value.to(self.device)
+
+    def _state_dict_options(
+            self,
+            *,
+            full_state_dict: bool | None = None,
+            broadcast_from_rank0: bool = False,
+    ) -> StateDictOptions:
+        if full_state_dict is None:
+            full_state_dict = self.parallelism_sharding != "fsdp2"
+        return StateDictOptions(
+            full_state_dict=bool(full_state_dict),
+            cpu_offload=True,
+            broadcast_from_rank0=broadcast_from_rank0,
+        )
+
+    def _module_state_dict_for_checkpoint(self, module: torch.nn.Module) -> Mapping[str, Any]:
+        if self.parallelism_sharding == "fsdp2":
+            return get_model_state_dict(module, options=self._state_dict_options())
+        return module.state_dict()
+
+    def _optimizer_state_dict_for_checkpoint(self) -> Mapping[str, Any] | None:
+        if self.parallelism_sharding == "zero1":
+            self.optimizer.consolidate_state_dict(to=0)
+            if self.is_distributed:
+                dist.barrier()
+            return self.optimizer.state_dict() if self.is_main_process else None
+        if self.parallelism_sharding == "fsdp2":
+            return get_optimizer_state_dict(
+                self.model_module,
+                self.optimizer,
+                options=self._state_dict_options(),
+            )
+        return self.optimizer.state_dict()
+
+    def _load_module_checkpoint_state(self, module: torch.nn.Module, state_dict: Mapping[str, Any]) -> None:
+        upgraded = _upgrade_weight_norm_state_dict_keys(state_dict)
+        if self.parallelism_sharding == "fsdp2":
+            set_model_state_dict(
+                module,
+                upgraded,
+                options=self._state_dict_options(broadcast_from_rank0=False),
+            )
+            return
+        module.load_state_dict(upgraded)
+
+    def _load_optimizer_checkpoint_state(self, optimizer_state: Mapping[str, Any]) -> None:
+        if self.parallelism_sharding == "fsdp2":
+            set_optimizer_state_dict(
+                self.model_module,
+                self.optimizer,
+                optimizer_state,
+                options=self._state_dict_options(broadcast_from_rank0=False),
+            )
+            return
+        self.optimizer.load_state_dict(optimizer_state)
+        self._optimizer_to_device()
+
+    def _clip_student_gradients(self) -> torch.Tensor:
+        if self.clip_grad <= 0.0:
+            return torch.zeros((), device=self.device)
+        parameters = [parameter for parameter in self.model_module.student.parameters() if parameter.grad is not None]
+        if not parameters:
+            return torch.zeros((), device=self.device)
+        if self.parallelism_sharding != "fsdp2":
+            return clip_grad_norm_(parameters, self.clip_grad)
+
+        local_norm_sq = torch.zeros((), device=self.device, dtype=torch.float32)
+        for parameter in parameters:
+            grad = parameter.grad.detach()
+            local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+            local_norm_sq += torch.sum(local_grad.float() * local_grad.float())
+        if self.data_parallel_group is not None:
+            dist.all_reduce(local_norm_sq, op=dist.ReduceOp.SUM, group=self.data_parallel_group)
+        total_norm = torch.sqrt(local_norm_sq)
+        clip_coef = torch.as_tensor(self.clip_grad, device=self.device, dtype=torch.float32) / (total_norm + 1e-6)
+        if clip_coef < 1.0:
+            for parameter in parameters:
+                parameter.grad.mul_(clip_coef.to(parameter.grad.device))
+        return total_norm
+
+    def _sync_context_parallel_gradients(self) -> None:
+        if self.context_parallel_size <= 1 or self.context_parallel_group is None:
+            return
+        for parameter in self.model_module.student.parameters():
+            grad = parameter.grad
+            if grad is None:
+                continue
+            local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+            dist.all_reduce(local_grad, op=dist.ReduceOp.SUM, group=self.context_parallel_group)
     
     def save_checkpoint(self, step: int) -> Path:
-        path = self.output_dir / f"checkpoint_step_{step:06d}.pt"
-        torch.save(
-            {
-                "step": step,
-                "config": self.config,
-                "wandb_run_id": self._current_wandb_run_id(),
-                "student": self.model_module.student.state_dict(),
-                "teacher": self.model_module.teacher.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
-                "dino_loss": self.dino_loss.state_dict(),
-                "ibot_patch_loss": self.ibot_patch_loss.state_dict(),
-                "gram_teacher_backbone": (
-                    self.gram_teacher_backbone.state_dict() if self.gram_teacher_backbone is not None else None
-                ),
-                "rng_state": self._capture_rng_state(),
-            },
-            path,
-        )
+        if self.parallelism_sharding == "fsdp2":
+            path = self.output_dir / f"checkpoint_step_{step:06d}.fsdp2"
+            path.mkdir(parents=True, exist_ok=True)
+            write_path = path / f"rank_{self.rank:05d}.pt"
+        else:
+            path = self.output_dir / f"checkpoint_step_{step:06d}.pt"
+            write_path = path
+        optimizer_state = self._optimizer_state_dict_for_checkpoint()
+        student_state = self._module_state_dict_for_checkpoint(self.model_module.student)
+        teacher_state = self._module_state_dict_for_checkpoint(self.model_module.teacher)
+        if self.parallelism_sharding == "fsdp2" or self.is_main_process:
+            torch.save(
+                {
+                    "step": step,
+                    "config": self.config,
+                    "wandb_run_id": self._current_wandb_run_id(),
+                    "parallelism_sharding": self.parallelism_sharding,
+                    "student": student_state,
+                    "teacher": teacher_state,
+                    "optimizer": optimizer_state,
+                    "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
+                    "dino_loss": self.dino_loss.state_dict(),
+                    "ibot_patch_loss": self.ibot_patch_loss.state_dict(),
+                    "gram_teacher_backbone": (
+                        self.gram_teacher_backbone.state_dict() if self.gram_teacher_backbone is not None else None
+                    ),
+                    "rng_state": self._capture_rng_state(),
+                },
+                write_path,
+            )
+        if self.parallelism_sharding == "fsdp2" and self.is_main_process:
+            metadata_path = path / "metadata.json"
+            with metadata_path.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "step": int(step),
+                        "world_size": int(self.world_size),
+                        "tensor_parallel_size": int(self.tensor_parallel_size),
+                        "context_parallel_size": int(self.context_parallel_size),
+                        "data_parallel_world_size": int(self.data_parallel_world_size),
+                        "format": "fsdp2_rank_sharded",
+                        "tensor_parallel_rank_local": bool(self.tensor_parallel_size > 1),
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
+                handle.write("\n")
+        if self.is_distributed:
+            dist.barrier()
         return path
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> int:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        self.model_module.student.load_state_dict(_upgrade_weight_norm_state_dict_keys(checkpoint["student"]))
-        self.model_module.teacher.load_state_dict(_upgrade_weight_norm_state_dict_keys(checkpoint["teacher"]))
-        if "optimizer" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            self._optimizer_to_device()
+        checkpoint_path = Path(checkpoint_path)
+        if checkpoint_path.is_dir():
+            checkpoint_file = checkpoint_path / f"rank_{self.rank:05d}.pt"
+        else:
+            checkpoint_file = checkpoint_path
+        checkpoint = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+        self._load_module_checkpoint_state(self.model_module.student, checkpoint["student"])
+        self._load_module_checkpoint_state(self.model_module.teacher, checkpoint["teacher"])
+        if checkpoint.get("optimizer") is not None:
+            self._load_optimizer_checkpoint_state(checkpoint["optimizer"])
         if checkpoint.get("scaler") is not None and self.scaler.is_enabled():
             self.scaler.load_state_dict(checkpoint["scaler"])
         if "dino_loss" in checkpoint:
@@ -1678,7 +2249,10 @@ class DinoIBOTPretrainer:
         return int(checkpoint.get("step", -1))
     
     def _find_latest_checkpoint(self) -> Path | None:
-        checkpoints = sorted(self.output_dir.glob("checkpoint_step_*.pt"))
+        checkpoints = sorted(
+            list(self.output_dir.glob("checkpoint_step_*.pt"))
+            + list(self.output_dir.glob("checkpoint_step_*.fsdp2"))
+        )
         if not checkpoints:
             return None
         return checkpoints[-1]
@@ -1937,14 +2511,21 @@ class DinoIBOTPretrainer:
         self._initialize_wandb()
         progress = tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") if self.is_main_process else None
         try:
-            for step in range(start_step, self.max_iterations):
+            def next_train_batch() -> Mapping[str, Any]:
+                nonlocal dataloader_iter
                 try:
-                    batch = next(dataloader_iter)
+                    return next(dataloader_iter)
                 except StopIteration:
                     self._train_sampler_epoch += 1
                     self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
                     dataloader_iter = iter(dataloader)
-                    batch = next(dataloader_iter)
+                    return next(dataloader_iter)
+
+            for step in range(start_step, self.max_iterations):
+                if self.gradient_accumulation_steps > 1:
+                    batch = [next_train_batch() for _ in range(self.gradient_accumulation_steps)]
+                else:
+                    batch = next_train_batch()
                 
                 metrics = self._average_metrics(self.train_step(batch, step))
                 if progress is not None:
@@ -1990,7 +2571,7 @@ class DinoIBOTPretrainer:
                             )
                 if self.task_eval_every and step > 0 and step % self.task_eval_every == 0:
                     self._run_task_evals(step)
-                if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:
+                if self.save_every_n and step > 0 and step % self.save_every_n == 0:
                     self.save_checkpoint(step)
         finally:
             if progress is not None:

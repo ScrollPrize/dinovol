@@ -24,6 +24,22 @@ def _memory_stats(device: torch.device) -> dict[str, float]:
     }
 
 
+def _sdpa_backend_stats(device: torch.device) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "torch_version": torch.__version__,
+        "flash_sdp_enabled": bool(torch.backends.cuda.flash_sdp_enabled()),
+        "mem_efficient_sdp_enabled": bool(torch.backends.cuda.mem_efficient_sdp_enabled()),
+        "math_sdp_enabled": bool(torch.backends.cuda.math_sdp_enabled()),
+    }
+    cudnn_sdp_enabled = getattr(torch.backends.cuda, "cudnn_sdp_enabled", None)
+    if callable(cudnn_sdp_enabled):
+        stats["cudnn_sdp_enabled"] = bool(cudnn_sdp_enabled())
+    if device.type == "cuda":
+        stats["cuda_device_name"] = torch.cuda.get_device_name(device)
+        stats["cuda_capability"] = list(torch.cuda.get_device_capability(device))
+    return stats
+
+
 def _batch_stats(batch: dict[str, Any]) -> dict[str, Any]:
     global_crops = batch["collated_global_crops"]
     local_crops = batch["collated_local_crops"]
@@ -63,7 +79,13 @@ def run_profile(config_path: Path, *, steps: int, train: bool, no_resume: bool) 
     try:
         iterator = iter(dataloader)
         for step in range(int(steps)):
-            batch = next(iterator)
+            accumulation_steps = trainer.gradient_accumulation_steps if train else 1
+            if accumulation_steps > 1:
+                batch = [next(iterator) for _ in range(accumulation_steps)]
+                batch_for_stats = batch[0]
+            else:
+                batch = next(iterator)
+                batch_for_stats = batch
             if trainer.device.type == "cuda":
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats(trainer.device)
@@ -82,9 +104,13 @@ def run_profile(config_path: Path, *, steps: int, train: bool, no_resume: bool) 
                     "local_rank": trainer.local_rank,
                     "data_parallel_rank": trainer.data_parallel_rank,
                     "tensor_parallel_rank": trainer.tensor_parallel_rank,
+                    "context_parallel_rank": trainer.context_parallel_rank,
                     "step": step,
                     "elapsed_seconds": elapsed,
-                    "batch": _batch_stats(batch),
+                    "batch": {
+                        **_batch_stats(batch_for_stats),
+                        "gradient_accumulation_steps": int(accumulation_steps),
+                    },
                     "metrics": {key: float(value) for key, value in metrics.items()},
                     "memory": _memory_stats(trainer.device),
                 }
@@ -105,6 +131,10 @@ def run_profile(config_path: Path, *, steps: int, train: bool, no_resume: bool) 
             "world_size": trainer.world_size,
             "data_parallel_world_size": trainer.data_parallel_world_size,
             "tensor_parallel_size": trainer.tensor_parallel_size,
+            "context_parallel_size": trainer.context_parallel_size,
+            "parallelism_sharding": trainer.parallelism_sharding,
+            "attention_mode": str(trainer.model_config.get("attention_mode", "dense")),
+            "sdpa_backend": _sdpa_backend_stats(trainer.device),
             "rank_reports": gathered,
         }
     return None
