@@ -7,6 +7,7 @@ from datetime import timedelta
 import json
 from pathlib import Path
 import random
+import time
 from typing import Any, Iterator, Mapping
 
 import numpy as np
@@ -756,6 +757,19 @@ class DinoIBOTPretrainer:
             )
         fully_shard(self.model, mesh=self.data_parallel_mesh, mp_policy=mp_policy, ignored_params=ignored_params_for(self.model))
         self._register_replicated_parameter_gradient_sync(replicated_params)
+
+    def _iter_fsdp_modules(self) -> Iterator[torch.nn.Module]:
+        if self.parallelism_sharding != "fsdp2":
+            return iter(())
+        return (
+            module
+            for module in self.model.modules()
+            if callable(getattr(module, "set_requires_gradient_sync", None))
+        )
+
+    def _set_fsdp_gradient_sync(self, enabled: bool) -> None:
+        for module in self._iter_fsdp_modules():
+            module.set_requires_gradient_sync(enabled)
     
     def _build_schedulers(self) -> tuple[
         CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler]:
@@ -1882,6 +1896,8 @@ class DinoIBOTPretrainer:
                 if isinstance(self.model, DDP) and not should_sync
                 else nullcontext()
             )
+            if self.parallelism_sharding == "fsdp2":
+                self._set_fsdp_gradient_sync(should_sync)
             with sync_context:
                 if self.low_memory_global_crops:
                     micro_metrics = self._backward_low_memory_micro_step(
@@ -2021,6 +2037,8 @@ class DinoIBOTPretrainer:
             metric_sums["koleo_loss"] += float(koleo_loss.detach())
             metric_sums["gram_loss"] += float(gram_loss.detach())
 
+        if self.parallelism_sharding == "fsdp2":
+            self._set_fsdp_gradient_sync(True)
         self.scaler.unscale_(self.optimizer)
         self._sync_context_parallel_gradients()
         self._clip_student_gradients()
@@ -2507,7 +2525,7 @@ class DinoIBOTPretrainer:
         val_dataloader = self.build_val_dataloader()
         if val_dataloader is not None:
             self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
-        val_dataloader_iter: Iterator[Any] | None = iter(val_dataloader) if val_dataloader is not None else None
+        val_dataloader_iter: Iterator[Any] | None = None
         self._initialize_wandb()
         progress = tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") if self.is_main_process else None
         try:
@@ -2522,12 +2540,25 @@ class DinoIBOTPretrainer:
                     return next(dataloader_iter)
 
             for step in range(start_step, self.max_iterations):
+                iter_start = time.perf_counter()
+                data_start = time.perf_counter()
                 if self.gradient_accumulation_steps > 1:
                     batch = [next_train_batch() for _ in range(self.gradient_accumulation_steps)]
                 else:
                     batch = next_train_batch()
-                
-                metrics = self._average_metrics(self.train_step(batch, step))
+                data_time = time.perf_counter() - data_start
+
+                train_start = time.perf_counter()
+                local_metrics = self.train_step(batch, step)
+                train_time = time.perf_counter() - train_start
+                local_metrics.update(
+                    {
+                        "data_time": data_time,
+                        "train_time": train_time,
+                        "iter_time": time.perf_counter() - iter_start,
+                    }
+                )
+                metrics = self._average_metrics(local_metrics)
                 if progress is not None:
                     progress.set_postfix(
                         loss=f"{metrics['loss']:.4f}",
@@ -2544,9 +2575,18 @@ class DinoIBOTPretrainer:
                 if self.is_main_process and step % self.log_every == 0:
                     print(
                         f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e} "
-                        f"gram={metrics['gram_loss']:.4f}"
+                        f"gram={metrics['gram_loss']:.4f} data={metrics['data_time']:.2f}s "
+                        f"train={metrics['train_time']:.2f}s iter={metrics['iter_time']:.2f}s"
                     )
                 if self.val_every_n and step > 0 and step % self.val_every_n == 0:
+                    if val_dataloader_iter is None:
+                        if val_dataloader is None:
+                            if self.is_main_process and not self._warned_missing_val_dataset:
+                                print("val_every_n is set but no val_dataset is configured; skipping validation.")
+                                self._warned_missing_val_dataset = True
+                            continue
+                        self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
+                        val_dataloader_iter = iter(val_dataloader)
                     if val_dataloader_iter is None:
                         if self.is_main_process and not self._warned_missing_val_dataset:
                             print("val_every_n is set but no val_dataset is configured; skipping validation.")

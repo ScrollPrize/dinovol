@@ -34,8 +34,8 @@
   "low_memory_global_crops": true,
   "low_memory_local_crops": true,
   "local_loss_chunk_size": 1,
-  "prefetch-factor": 6,
-  "dataloader-workers": 14,
+  "prefetch-factor": 1,
+  "dataloader-workers": 4,
   "persistent_workers": true,
   "distributed_timeout_seconds": 1800,
   "parallelism": {
