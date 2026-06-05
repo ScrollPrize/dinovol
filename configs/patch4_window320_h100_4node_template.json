@@ -40,8 +40,8 @@
   "distributed_timeout_seconds": 1800,
   "parallelism": {
     "strategy": "mesh",
-    "tensor_parallel_size": 4,
-    "context_parallel_size": 2,
+    "tensor_parallel_size": 2,
+    "context_parallel_size": 4,
     "sharding": "fsdp2"
   },
   "koleo": {
