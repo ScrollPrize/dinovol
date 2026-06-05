@@ -159,6 +159,35 @@ class PretrainSmokeTests(unittest.TestCase):
         self.assertTrue(report["train_step"]["checks"]["all_passed"])
         self.assertEqual(report["forward"]["losses"]["gram"], 0.0)
 
+    def test_fit_allows_accumulation_across_epoch_boundary(self) -> None:
+        config = self._base_config(output_name="accumulation_epoch_boundary")
+        config["max_iterations"] = 1
+        config["gradient_accumulation_steps"] = 3
+        config["dataset"] = copy.deepcopy(config["dataset"])
+        config["dataset"]["epoch_length"] = 1
+        trainer = DinoIBOTPretrainer(config)
+        try:
+            trainer.fit()
+        finally:
+            trainer._close_auxiliary_datasets()
+            trainer._finish_wandb()
+
+    def test_default_epoch_length_covers_distributed_accumulation(self) -> None:
+        config = self._base_config(output_name="distributed_epoch_length_default")
+        config["max_iterations"] = 1
+        config["batch_size"] = 2
+        config["gradient_accumulation_steps"] = 3
+        config["dataset"] = copy.deepcopy(config["dataset"])
+        config["dataset"].pop("epoch_length", None)
+        trainer = DinoIBOTPretrainer(config)
+        try:
+            trainer.data_parallel_world_size = 4
+            prepared = trainer._prepare_dataset_config(config["dataset"])
+            self.assertEqual(prepared["epoch_length"], 24)
+        finally:
+            trainer._close_auxiliary_datasets()
+            trainer._finish_wandb()
+
     def test_gram_refinement_smoke_step(self) -> None:
         report = build_verification_report(self._gram_config(output_name="gram_smoke"), use_amp=False)
         self.assertTrue(report["forward"]["checks"]["all_passed"])

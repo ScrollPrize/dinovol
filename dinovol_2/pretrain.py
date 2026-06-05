@@ -844,10 +844,18 @@ class DinoIBOTPretrainer:
 
     def _prepare_dataset_config(self, dataset_config: Mapping[str, Any]) -> dict[str, Any]:
         resolved_config = dict(dataset_config)
-        resolved_config.setdefault(
-            "epoch_length",
-            int(self.config.get("official_epoch_length", self.config.get("epoch_length", self.max_iterations))),
-        )
+        if "epoch_length" not in resolved_config:
+            default_epoch_length = int(
+                self.config.get("official_epoch_length", self.config.get("epoch_length", self.max_iterations))
+            )
+            if "official_epoch_length" not in self.config and "epoch_length" not in self.config:
+                min_epoch_length = (
+                    int(self.config.get("batch_size", 2))
+                    * int(self.data_parallel_world_size)
+                    * int(self.gradient_accumulation_steps)
+                )
+                default_epoch_length = max(default_epoch_length, min_epoch_length)
+            resolved_config["epoch_length"] = default_epoch_length
         if self.do_gram:
             resolved_config.setdefault(
                 "gram_teacher_crop_size",
@@ -1035,6 +1043,13 @@ class DinoIBOTPretrainer:
             return
         if isinstance(dataloader.sampler, DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
+
+    @staticmethod
+    def _dataloader_num_batches(dataloader: DataLoader | WeightedCombinedLoader) -> int | None:
+        try:
+            return len(dataloader)
+        except TypeError:
+            return None
 
     @staticmethod
     def _close_dataloader(dataloader: DataLoader | WeightedCombinedLoader | None) -> None:
@@ -2520,6 +2535,12 @@ class DinoIBOTPretrainer:
             start_step = self.load_checkpoint(resume_path) + 1
         
         dataloader = self.build_dataloader()
+        train_num_batches = self._dataloader_num_batches(dataloader)
+        if train_num_batches == 0:
+            raise RuntimeError(
+                "training dataloader produced zero batches. Check dataset epoch_length, "
+                "batch_size, DistributedSampler drop_last, and data-parallel world size."
+            )
         self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
         dataloader_iter: Iterator[Any] = iter(dataloader)
         val_dataloader = self.build_val_dataloader()
@@ -2531,13 +2552,21 @@ class DinoIBOTPretrainer:
         try:
             def next_train_batch() -> Mapping[str, Any]:
                 nonlocal dataloader_iter
-                try:
-                    return next(dataloader_iter)
-                except StopIteration:
+                empty_resets = 0
+                while True:
+                    try:
+                        return next(dataloader_iter)
+                    except StopIteration:
+                        empty_resets += 1
+                        if empty_resets > 1:
+                            raise RuntimeError(
+                                "training dataloader exhausted without yielding after reset. "
+                                "Check dataset epoch_length, batch_size, DistributedSampler "
+                                "drop_last, and data-parallel world size."
+                            )
                     self._train_sampler_epoch += 1
                     self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
                     dataloader_iter = iter(dataloader)
-                    return next(dataloader_iter)
 
             for step in range(start_step, self.max_iterations):
                 iter_start = time.perf_counter()

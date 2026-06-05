@@ -9,6 +9,7 @@ import unittest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.utils.data import DataLoader, TensorDataset
 
 from dinovol_2.config import load_config
 from dinovol_2.loss import KoLeoLoss, iBOTPatchLoss
@@ -17,6 +18,7 @@ from dinovol_2.model.model import DinoVitStudentTeacher
 from dinovol_2.model.rope import MixedRopePositionEmbedding
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import resolve_distributed_config
+from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
 
 
 def _fake_sample(global_size: int = 16, local_size: int = 8) -> dict:
@@ -223,6 +225,12 @@ class ParallelismSupportTests(unittest.TestCase):
         full_loss = full.forward_masked(student, teacher, masks, n_masked_patches=17, masks_weight=weights)
         chunked_loss = chunked.forward_masked(student, teacher, masks, n_masked_patches=17, masks_weight=weights)
         self.assertTrue(torch.allclose(full_loss, chunked_loss, atol=1e-6, rtol=1e-6))
+
+    def test_weighted_loader_rejects_zero_batch_loader(self) -> None:
+        empty_loader = DataLoader(TensorDataset(torch.empty(0, 1)), batch_size=1, drop_last=True)
+        loader = WeightedCombinedLoader([empty_loader], weights=(1.0,))
+        with self.assertRaisesRegex(RuntimeError, "zero batches"):
+            iter(loader)
 
     def test_distributed_koleo_gathers_and_backprops(self) -> None:
         ctx = mp.get_context("spawn")

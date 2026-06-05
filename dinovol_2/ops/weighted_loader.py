@@ -8,6 +8,13 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 
+def _safe_len(dataloader: DataLoader) -> int | None:
+    try:
+        return len(dataloader)
+    except TypeError:
+        return None
+
+
 def _set_dataloader_epoch(dataloader: DataLoader, epoch: int) -> None:
     sampler = getattr(dataloader, "sampler", None)
     if isinstance(sampler, DistributedSampler):
@@ -37,7 +44,14 @@ class _WeightedCombinedLoaderIterator:
         self.loader = loader
         self.rng = random.Random(loader.seed)
         self.states = [_LoaderState(dataloader=dataloader) for dataloader in loader.dataloaders]
-        for state in self.states:
+        for index, state in enumerate(self.states):
+            length = _safe_len(state.dataloader)
+            if length == 0:
+                raise RuntimeError(
+                    "WeightedCombinedLoader got a dataloader with zero batches "
+                    f"at index {index}. Check dataset epoch_length, batch_size, "
+                    "DistributedSampler drop_last, and data-parallel world size."
+                )
             _set_dataloader_epoch(state.dataloader, state.epoch)
             state.iterator = iter(state.dataloader)
 
@@ -47,11 +61,19 @@ class _WeightedCombinedLoaderIterator:
     def __next__(self) -> Any:
         index = self.rng.choices(range(len(self.states)), weights=self.loader.weights, k=1)[0]
         state = self.states[index]
+        empty_resets = 0
         while True:
             try:
                 assert state.iterator is not None
                 return next(state.iterator)
             except StopIteration:
+                empty_resets += 1
+                if empty_resets > 1:
+                    raise RuntimeError(
+                        "WeightedCombinedLoader dataloader exhausted without yielding "
+                        f"after reset at index {index}. Check dataset epoch_length, "
+                        "batch_size, DistributedSampler drop_last, and data-parallel world size."
+                    )
                 state.epoch += 1
                 _set_dataloader_epoch(state.dataloader, state.epoch)
                 state.iterator = iter(state.dataloader)
