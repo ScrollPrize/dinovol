@@ -236,7 +236,12 @@ class EvaAttention(nn.Module):
     def _context_parallel_patch_range(self, rope_shape: Optional[Tuple[int, ...]]) -> tuple[int, int, int]:
         if rope_shape is None:
             raise ValueError("context parallel attention requires rope_shape.")
-        n_patches = math.prod(int(dim) for dim in rope_shape)
+        if len(rope_shape) != 3:
+            raise ValueError(f"context parallel attention requires a 3D rope_shape, got {rope_shape}.")
+        depth = int(rope_shape[0])
+        height = int(rope_shape[1])
+        width = int(rope_shape[2])
+        n_patches = depth * height * width
         if n_patches % self.context_parallel_size != 0:
             raise ValueError(
                 f"patch token count {n_patches} must be divisible by context_parallel_size="
@@ -441,30 +446,36 @@ class EvaAttention(nn.Module):
     ) -> torch.Tensor:
         if rope_shape is None or len(rope_shape) != 3:
             raise ValueError("window_global_3d attention requires a 3D patch grid shape.")
-        spatial_shape = tuple(int(dim) for dim in rope_shape)
-        if any(dim <= 0 for dim in spatial_shape):
+        depth = int(rope_shape[0])
+        height = int(rope_shape[1])
+        width = int(rope_shape[2])
+        spatial_shape = (depth, height, width)
+        if depth <= 0 or height <= 0 or width <= 0:
             raise ValueError(f"window_global_3d received invalid spatial shape: {spatial_shape}")
-        patch_tokens = math.prod(spatial_shape)
+        patch_tokens = depth * height * width
         if q.shape[-2] != self.num_prefix_tokens + patch_tokens:
             raise ValueError(
                 "window_global_3d token count mismatch: "
                 f"tokens={q.shape[-2]}, prefix={self.num_prefix_tokens}, patch_grid={spatial_shape}"
             )
 
-        window_shape = tuple(
-            min(window, dim) if window > 0 else dim
-            for window, dim in zip(self.window_size_patches, spatial_shape)
-        )
-        for dim, window in zip(spatial_shape, window_shape):
-            if dim % window != 0:
-                raise ValueError(
-                    "window_global_3d requires each patch-grid dimension to be divisible by the window size; "
-                    f"got spatial_shape={spatial_shape}, window_size_patches={window_shape}"
-                )
-        shift_shape = tuple(
-            min(shift, window - 1) if dim > window else 0
-            for shift, window, dim in zip(self.shift_size_patches, window_shape, spatial_shape)
-        )
+        configured_window_d, configured_window_h, configured_window_w = self.window_size_patches
+        window_d = min(configured_window_d, depth) if configured_window_d > 0 else depth
+        window_h = min(configured_window_h, height) if configured_window_h > 0 else height
+        window_w = min(configured_window_w, width) if configured_window_w > 0 else width
+        window_shape = (window_d, window_h, window_w)
+        if depth % window_d != 0 or height % window_h != 0 or width % window_w != 0:
+            raise ValueError(
+                "window_global_3d requires each patch-grid dimension to be divisible by the window size; "
+                f"got spatial_shape={spatial_shape}, window_size_patches={window_shape}"
+            )
+
+        configured_shift_d, configured_shift_h, configured_shift_w = self.shift_size_patches
+        shift_d = min(configured_shift_d, window_d - 1) if depth > window_d else 0
+        shift_h = min(configured_shift_h, window_h - 1) if height > window_h else 0
+        shift_w = min(configured_shift_w, window_w - 1) if width > window_w else 0
+        shift_shape = (shift_d, shift_h, shift_w)
+        has_shift = shift_d != 0 or shift_h != 0 or shift_w != 0
 
         q_prefix = q[:, :, :self.num_prefix_tokens]
         k_prefix = k[:, :, :self.num_prefix_tokens]
@@ -480,8 +491,8 @@ class EvaAttention(nn.Module):
             dropout_p=self.attn_drop.p if self.training else 0.0,
         )
 
-        if any(shift_shape):
-            roll_shifts = tuple(-shift for shift in shift_shape)
+        if has_shift:
+            roll_shifts = (-shift_d, -shift_h, -shift_w)
             q_patch = torch.roll(q_patch, shifts=roll_shifts, dims=(2, 3, 4))
             k_patch = torch.roll(k_patch, shifts=roll_shifts, dims=(2, 3, 4))
             v_patch = torch.roll(v_patch, shifts=roll_shifts, dims=(2, 3, 4))
@@ -514,7 +525,7 @@ class EvaAttention(nn.Module):
             spatial_shape=spatial_shape,
             window_shape=window_shape,
         )
-        if any(shift_shape):
+        if has_shift:
             patch_out = torch.roll(patch_out, shifts=shift_shape, dims=(2, 3, 4))
         patch_out = patch_out.reshape(q.shape[0], q.shape[1], patch_tokens, q.shape[-1])
         return torch.cat((prefix_out, patch_out), dim=-2)
@@ -749,7 +760,7 @@ class EvaBlock(nn.Module):
                 **rope_kwargs_local,
             )
         self.gamma_1 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
-        self.drop_path1 = CompileStableDropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
+        self.drop_path1 = CompileStableDropPath(drop_path, drop_path_scale)
         
         self.norm2 = norm_layer(dim)
         hidden_features = int(dim * mlp_ratio)
@@ -781,7 +792,7 @@ class EvaBlock(nn.Module):
                 drop=proj_drop,
             )
         self.gamma_2 = nn.Parameter(init_values * torch.ones(dim)) if init_values is not None else None
-        self.drop_path2 = CompileStableDropPath(drop_path, drop_path_scale) if drop_path > 0. else nn.Identity()
+        self.drop_path2 = CompileStableDropPath(drop_path, drop_path_scale)
         self.mlp_token_chunk_size = self._normalize_optional_positive_int(
             mlp_token_chunk_size,
             name="mlp_token_chunk_size",
