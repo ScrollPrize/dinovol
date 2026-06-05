@@ -125,25 +125,26 @@ uv run python -m unittest tests.test_pretrain_smoke -v
 
 ## Patch-4 Multi-Node Pretraining
 
-Patch-4 128³/64³ crops are supported through a `tp_ddp` strategy intended for
-H100-class multi-node runs. The implementation keeps tensor-parallel groups
-node-local, shards EVA attention heads across each tensor-parallel group, uses
-data parallelism across groups, gathers KoLeo CLS tokens across the data-parallel
-group, and caps/chunks iBOT masked-token projection and loss.
+Patch-4 crops are supported through the mesh strategy intended for H100-class
+multi-node runs. The production path uses data parallelism, context parallelism,
+tensor parallelism, FSDP2 state sharding, activation checkpointing, distributed
+KoLeo, capped/chunked iBOT, mixed RoPE, and `window_global_3d` attention.
 
 Relevant config keys:
 
 - `amp_dtype`: `auto`, `bf16`, `fp16`, or `off`
-- `parallelism.strategy`: `ddp` or `tp_ddp`
-- `parallelism.tensor_parallel_size`: tensor-parallel group size; patch-4 H100
-  runs should start at `4` and move to `8` if memory remains above target
+- `parallelism.strategy`: `ddp`, `tp_ddp`, or `mesh`
+- `parallelism.tensor_parallel_size`: tensor-parallel group size
+- `parallelism.context_parallel_size`: context-parallel group size
+- `parallelism.sharding`: `none`, `fsdp2`, or `zero1`
 - `koleo.distributed`: gather CLS tokens across data-parallel ranks before KoLeo
 - `ibot.max_masked_patches_per_rank`: absolute cap on selected masked patches
 - `ibot.projection_chunk_size` and `ibot.loss_chunk_size`: iBOT memory controls
 - `distributed_timeout_seconds`: process-group timeout for slower multi-node starts
 
-The production template is `configs/patch4_tpddp_h100_template.json`. It uses
-environment placeholders for outputs and dataset manifests, so host names,
+The current 4-node production template for patch-4 320³/160³ crops is
+`configs/patch4_window320_h100_4node_template.json`. It uses environment
+placeholders for outputs, dataset manifests, and W&B run naming, so host names,
 credentials, storage URLs, and machine-local paths stay outside the repository.
 
 Synthetic profiler smoke setup:
@@ -159,15 +160,41 @@ OUTPUT_DIR="$RUN_DIR/output" SYNTHETIC_ZARR="$RUN_DIR/synthetic.zarr" \
 Multi-node launch template:
 
 ```bash
-CONFIG=configs/patch4_tpddp_h100_template.json \
+CONFIG=configs/patch4_window320_h100_4node_template.json \
 NNODES="$NNODES" NODE_RANK="$NODE_RANK" MASTER_ADDR="$MASTER_ADDR" \
   scripts/launch_multinode_pretrain.sh
 ```
 
+For c10d rendezvous on private IPs, pass `RDZV_CONF=is_host=true,read_timeout=300`
+on node rank 0 and `RDZV_CONF=is_host=false,read_timeout=300` on the other nodes.
+This avoids relying on torchrun's hostname/IP host-election heuristic.
+
+For RDMA/RoCE launches, keep `NCCL_IB_DISABLE` unset and pass HCA/GID selection
+from the runtime environment. On the tested 4-node H100 allocation, the stable
+single rail was:
+
+```bash
+NCCL_SOCKET_IFNAME=eth0 \
+GLOO_SOCKET_IFNAME=eth0 \
+NCCL_IB_HCA=mlx5_2 \
+NCCL_IB_GID_INDEX=3 \
+NCCL_IB_ADDR_FAMILY=AF_INET \
+NCCL_IB_ROCE_VERSION_NUM=2 \
+REQUIRE_NCCL_RDMA_ENV=1
+```
+
+Run the collective probe before a full training launch on every new allocation:
+
+```bash
+CONFIG_REQUIRED=0 MODULE=dinovol_2.collective_probe \
+NNODES="$NNODES" NODE_RANK="$NODE_RANK" MASTER_ADDR="$MASTER_ADDR" \
+RDZV_CONF="$RDZV_CONF" NCCL_IB_HCA="$NCCL_IB_HCA" NCCL_IB_GID_INDEX="$NCCL_IB_GID_INDEX" \
+  scripts/launch_multinode_pretrain.sh --min-bytes 1048576 --max-bytes 67108864 --steps 5
+```
+
 For profiling under torchrun, set `MODULE=dinovol_2.profile_pretrain` and pass
-profile arguments after the script name. Sequence/context parallelism, FSDP/ZeRO,
-and sparse/windowed attention are not implemented here; patch-3 is experimental,
-and patch-2 still requires an architectural attention change.
+profile arguments after the script name. Patch-3 and patch-2 remain research
+modes and require separate validation before production training.
 
 ## Optional Task Eval During Pretraining
 
