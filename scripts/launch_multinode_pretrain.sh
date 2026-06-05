@@ -8,6 +8,7 @@ set -euo pipefail
 MASTER_PORT="${MASTER_PORT:-29500}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 RDZV_ID="${RDZV_ID:-dinovol-pretrain}"
+RDZV_BACKEND="${RDZV_BACKEND:-c10d}"
 MODULE="${MODULE:-dinovol_2.pretrain}"
 CONFIG_ARGS=()
 if [[ -n "${CONFIG:-}" ]]; then
@@ -46,12 +47,21 @@ if [[ -z "${LOCAL_ADDR:-}" ]]; then
   echo "warning: LOCAL_ADDR is not set; torchrun may advertise a hostname that peer nodes cannot route." >&2
 fi
 
+TORCHRUN_ARGS=(
+  --nnodes="${NNODES}"
+  --nproc-per-node="${NPROC_PER_NODE}"
+  --node-rank="${NODE_RANK}"
+)
+if [[ "${RDZV_BACKEND}" == "static" ]]; then
+  TORCHRUN_ARGS+=(--master-addr="${MASTER_ADDR}" --master-port="${MASTER_PORT}")
+else
+  TORCHRUN_ARGS+=(--rdzv-backend="${RDZV_BACKEND}" --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" --rdzv-id="${RDZV_ID}")
+fi
+if [[ -n "${TORCHRUN_NUMA_BINDING:-}" ]]; then
+  TORCHRUN_ARGS+=(--numa-binding="${TORCHRUN_NUMA_BINDING}")
+fi
+
 "${UV_BIN}" run python -m torch.distributed.run \
-  --nnodes="${NNODES}" \
-  --nproc-per-node="${NPROC_PER_NODE}" \
-  --node-rank="${NODE_RANK}" \
-  --rdzv-backend=c10d \
-  --rdzv-endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
-  --rdzv-id="${RDZV_ID}" \
+  "${TORCHRUN_ARGS[@]}" \
   "${LOCAL_ADDR_ARGS[@]}" \
   -m "${MODULE}" "${CONFIG_ARGS[@]}" "$@"
