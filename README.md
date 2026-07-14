@@ -22,6 +22,31 @@ To select the newer defaults explicitly, set `model.model_type` to `v2` in the c
 }
 ```
 
+## Optimizer Schedules (DINOv3-style)
+
+Following DINOv3, learning rate, weight decay, and teacher EMA momentum are held **constant** by default — only the learning rate and teacher temperature keep a linear **warmup**. This removes hard-to-tune hyperparameters (final lr, weight-decay end, final momentum, optimization horizon) and lets a run continue as long as downstream metrics keep improving.
+
+**Defaults / flat keys (backward compatible).** Existing configs keep working. When `min_lr`, `weight_decay_end`, or `final_momentum_teacher` are omitted they now default to their base values (constant), instead of decaying to `1e-6` / `0.4` / `1.0`. Set any of them explicitly to recover cosine decay.
+
+**`schedules` block (recommended).** Add a `schedules` block to opt into the full DINOv3 layout (mirrors `dinov3/configs/train/dinov3_vit7b16_pretrain.yaml`). When present, it replaces the flat `lr`/`min_lr`/`weight_decay`/`weight_decay_end`/`momentum_teacher`/`warmup_*` keys:
+
+```json
+{
+  "scaling_rule": "none",
+  "max_iterations": 1000000,
+  "schedules": {
+    "lr":           { "start": 0.0, "peak": 5e-5, "end": 5e-5, "warmup_ratio": 0.1, "freeze_last_layer_ratio": 0.005 },
+    "weight_decay": { "start": 0.04, "peak": 0.04, "end": 0.04, "warmup_ratio": 0.0 },
+    "teacher_temp": { "start": 0.04, "peak": 0.07, "end": 0.07, "warmup_ratio": 0.1 },
+    "momentum":     { "start": 0.994, "peak": 0.994, "end": 0.994, "warmup_ratio": 0.0 }
+  }
+}
+```
+
+- Each block's warmup / freeze duration accepts `*_ratio` (fraction of `max_iterations`), `*_steps` (absolute), or `*_epochs` (requires `official_epoch_length`/`epoch_length`).
+- Schedules are constant after warmup by default. Add `cosine_epochs` or `cosine_steps` to a block to re-enable cosine decay from `peak` to `end`.
+- `scaling_rule` (`none` | `sqrt` | `linear`, default `none`) applies batch-size LR scaling to the lr `peak`/`end` (and to the flat-key `lr`/`min_lr`). It follows DINOv3's approach but is **anchored to our own global effective batch** rather than their fixed 1024/256 constants: set `lr_reference_batch_size` to the effective batch (`batch_size * world_size`) your peak lr was tuned at, and the peak is rescaled by `sqrt(eff / reference)` (`sqrt`) or `eff / reference` (`linear`). `lr_reference_batch_size` defaults to the current effective batch, so the factor is `1.0` until you declare a reference — no surprise magnitude shifts. Example: `lr` tuned at reference `8`, running at `batch_size 2 × world_size 8 = 16` → `sqrt` gives `lr × sqrt(16/8) = lr × 1.414`.
+
 ## Gram Anchoring And HR Adaptation
 
 `pretrain.py` now supports the three-stage DINOv3-style workflow:

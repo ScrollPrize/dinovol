@@ -242,10 +242,13 @@ class SSLZarrDataset(Dataset):
                 f"got source_read_window_size={self.source_read_window_size} and required={required_read_window_size}"
             )
         
-        self.global_transforms = [create_training_transforms(self.global_view_size) for _ in
+        transform_kwargs = {
+            "spatial_only": bool(self.config.get("spatial_augmentations_only", False)),
+        }
+        self.global_transforms = [create_training_transforms(self.global_view_size, **transform_kwargs) for _ in
                                   range(self.num_global_crops)]
         self.local_transforms = (
-            [create_training_transforms(self.local_view_size) for _ in range(self.num_local_crops)]
+            [create_training_transforms(self.local_view_size, **transform_kwargs) for _ in range(self.num_local_crops)]
             if self.local_view_size is not None
             else []
         )

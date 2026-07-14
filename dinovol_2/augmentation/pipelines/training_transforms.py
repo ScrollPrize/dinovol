@@ -59,6 +59,7 @@ def create_training_transforms(
     no_spatial: bool = False,
     no_scaling: bool = False,
     only_spatial_and_intensity: bool = False,
+    spatial_only: bool = False,
     allowed_rotation_axes: Optional[List[int]] = None,
     skeleton_targets: Optional[List[str]] = None,
     skeleton_ignore_values: Optional[Dict[str, int]] = None,
@@ -77,6 +78,8 @@ def create_training_transforms(
         issues with semi-supervised trainers like mean teacher).
     only_spatial_and_intensity : bool
         If True, only use spatial and basic intensity transforms (skip noise, blur, etc.).
+    spatial_only : bool
+        If True, use only spatial transforms and skip every intensity/noise transform.
     allowed_rotation_axes : Optional[List[int]]
         Restrict rotations to specific axes. None means all axes.
     skeleton_targets : Optional[List[str]]
@@ -170,7 +173,16 @@ def create_training_transforms(
 
         # Rot90 for 3D (only if there are valid rotation axes). Mirror is enabled
         # for both 2D and 3D so axis-wise flips remain part of the default spatial augmentation set.
-        if dimension == 3 and rot90_allowed_axes:
+        if dimension == 2 and patch_h == patch_w:
+            transforms.append(RandomTransform(
+                Rot90Transform(
+                    num_axis_combinations=1,
+                    num_rot_per_combination=(1, 2, 3),
+                    allowed_axes={0, 1},
+                ),
+                apply_probability=0.5,
+            ))
+        elif dimension == 3 and rot90_allowed_axes:
             transforms.append(RandomTransform(
                 Rot90Transform(
                     num_axis_combinations=1,
@@ -221,6 +233,9 @@ def create_training_transforms(
         #             ),
         #         ])
         #     )
+
+    if spatial_only:
+        return ComposeTransforms(transforms)
 
     # =========================================================================
     # BLANK RECTANGLE (conditional)

@@ -39,7 +39,6 @@ class _WeightedCombinedLoaderIterator:
         self.states = [_LoaderState(dataloader=dataloader) for dataloader in loader.dataloaders]
         for state in self.states:
             _set_dataloader_epoch(state.dataloader, state.epoch)
-            state.iterator = iter(state.dataloader)
 
     def __iter__(self) -> "_WeightedCombinedLoaderIterator":
         return self
@@ -49,7 +48,8 @@ class _WeightedCombinedLoaderIterator:
         state = self.states[index]
         while True:
             try:
-                assert state.iterator is not None
+                if state.iterator is None:
+                    state.iterator = iter(state.dataloader)
                 return next(state.iterator)
             except StopIteration:
                 state.epoch += 1
@@ -58,7 +58,7 @@ class _WeightedCombinedLoaderIterator:
 
 
 class WeightedCombinedLoader:
-    """Sample batches from multiple dataloaders using fixed weights."""
+    """Sample batches by weight, starting each source only when first selected."""
 
     def __init__(
         self,

@@ -10,7 +10,7 @@ import torch
 import zarr
 
 from dinovol_2.loss import GramLoss
-from dinovol_2.pretrain import DinoIBOTPretrainer
+from dinovol_2.pretrain import DinoIBOTPretrainer, linear_warmup_cosine_decay
 from dinovol_2.verify import build_verification_report
 
 
@@ -159,6 +159,30 @@ class PretrainSmokeTests(unittest.TestCase):
         self.assertTrue(report["train_step"]["checks"]["all_passed"])
         self.assertEqual(report["forward"]["losses"]["gram"], 0.0)
 
+    def test_fit_writes_training_monitor_without_wandb(self) -> None:
+        config = self._base_config(output_name="local_monitor")
+        config["monitor_every_n"] = 1
+        config["wandb_project"] = None
+        trainer = DinoIBOTPretrainer(config)
+        metrics = {
+            "loss": 1.0,
+            "dino_global_loss": 0.4,
+            "dino_local_loss": 0.2,
+            "ibot_loss": 0.3,
+            "koleo_loss": 0.1,
+            "gram_loss": 0.0,
+            "component_loss": 0.0,
+            "lr": 1e-4,
+        }
+        trainer.train_step = lambda _batch, _step: metrics
+        try:
+            trainer.fit()
+            self.assertIsNone(trainer._wandb)
+            self.assertTrue((trainer.monitor_dir / "monitor_step_000001.jpg").is_file())
+        finally:
+            trainer._close_auxiliary_datasets()
+            trainer._finish_wandb()
+
     def test_gram_refinement_smoke_step(self) -> None:
         report = build_verification_report(self._gram_config(output_name="gram_smoke"), use_amp=False)
         self.assertTrue(report["forward"]["checks"]["all_passed"])
@@ -247,6 +271,97 @@ class PretrainSmokeTests(unittest.TestCase):
             loaded_step = trainer.load_checkpoint(checkpoint)
             self.assertEqual(loaded_step, 0)
             self.assertLess(_state_dict_l1_diff(trainer.gram_teacher_backbone, trainer.model_module.teacher.backbone), 1e-6)
+        finally:
+            trainer._close_auxiliary_datasets()
+            trainer._finish_wandb()
+
+    @classmethod
+    def _schedule_config(cls, *, output_name: str) -> dict:
+        config = cls._base_config(output_name=output_name)
+        config["max_iterations"] = 20
+        config.pop("warmup_steps", None)
+        config["schedules"] = {
+            "lr": {"start": 0.0, "peak": 1e-3, "end": 1e-3, "warmup_steps": 5, "freeze_last_layer_steps": 3},
+            "weight_decay": {"start": 0.05, "peak": 0.05, "end": 0.05, "warmup_steps": 0},
+            "momentum": {"start": 0.99, "peak": 0.99, "end": 0.99, "warmup_steps": 0},
+            "teacher_temp": {"start": 0.02, "peak": 0.06, "end": 0.06, "warmup_steps": 4},
+        }
+        return config
+
+    def test_linear_warmup_cosine_decay_shapes(self) -> None:
+        # Constant with warmup: ramp over warmup, flat afterwards.
+        sched = linear_warmup_cosine_decay(start=0.0, peak=1.0, end=1.0, warmup_iters=5, total_iters=20)
+        self.assertEqual(len(sched), 20)
+        self.assertEqual(sched[0], 0.0)
+        self.assertTrue(np.all(np.diff(sched[:6]) > 0))  # strictly increasing through warmup
+        np.testing.assert_allclose(sched[5:], 1.0)  # constant tail
+        # Opt-in cosine decay from peak to end.
+        decay = linear_warmup_cosine_decay(start=0.0, peak=1.0, end=0.0, warmup_iters=0, total_iters=10)
+        self.assertAlmostEqual(decay[0], 1.0)
+        self.assertLess(decay[-1], decay[0])
+
+    def test_schedules_block_constant_with_warmup(self) -> None:
+        trainer = DinoIBOTPretrainer(self._schedule_config(output_name="sched_block"))
+        try:
+            lr = trainer.lr_schedule.schedule
+            self.assertEqual(len(lr), 20)
+            self.assertEqual(lr[0], 0.0)
+            self.assertTrue(np.all(np.diff(lr[:6]) > 0))
+            np.testing.assert_allclose(lr[5:], 1e-3)  # constant after warmup
+            np.testing.assert_allclose(trainer.wd_schedule.schedule, 0.05)  # constant WD
+            np.testing.assert_allclose(trainer.momentum_schedule.schedule, 0.99)  # constant momentum
+            # Freeze zeros the first 3 last-layer steps, then follows the warmup ramp.
+            np.testing.assert_allclose(trainer.last_layer_lr_schedule.schedule[:3], 0.0)
+            self.assertGreater(trainer.last_layer_lr_schedule.schedule[3], 0.0)
+            temp = trainer.teacher_temp_schedule.schedule
+            self.assertAlmostEqual(temp[0], 0.02)
+            np.testing.assert_allclose(temp[4:], 0.06)  # temp warmup then constant
+        finally:
+            trainer._close_auxiliary_datasets()
+            trainer._finish_wandb()
+
+    def test_schedules_block_train_step(self) -> None:
+        # No LR warmup/freeze so step 0 has a non-zero LR and params actually update.
+        config = self._schedule_config(output_name="sched_e2e")
+        config["schedules"]["lr"] = {"start": 1e-3, "peak": 1e-3, "end": 1e-3, "warmup_steps": 0, "freeze_last_layer_steps": 0}
+        report = build_verification_report(config, use_amp=False)
+        self.assertTrue(report["forward"]["checks"]["all_passed"])
+        self.assertTrue(report["train_step"]["checks"]["all_passed"])
+
+    def test_scaling_rule_scales_peak_lr(self) -> None:
+        # Effective batch = batch_size * world_size = 16 * 1; reference = 4 -> ratio 4.
+        base = self._schedule_config(output_name="sched_scale_none")
+        base["batch_size"] = 16
+        base["scaling_rule"] = "none"
+        sqrt_cfg = copy.deepcopy(base)
+        sqrt_cfg["output_dir"] = str(self.root / "sched_scale_sqrt")
+        sqrt_cfg["scaling_rule"] = "sqrt"
+        sqrt_cfg["lr_reference_batch_size"] = 4
+        linear_cfg = copy.deepcopy(base)
+        linear_cfg["output_dir"] = str(self.root / "sched_scale_linear")
+        linear_cfg["scaling_rule"] = "linear"
+        linear_cfg["lr_reference_batch_size"] = 4
+
+        def _peak(config: dict) -> float:
+            trainer = DinoIBOTPretrainer(config)
+            try:
+                return float(trainer.lr_schedule.schedule[-1])
+            finally:
+                trainer._close_auxiliary_datasets()
+                trainer._finish_wandb()
+
+        peak_none = _peak(base)
+        self.assertAlmostEqual(_peak(sqrt_cfg), peak_none * 2.0, places=8)   # sqrt(16/4) = 2
+        self.assertAlmostEqual(_peak(linear_cfg), peak_none * 4.0, places=8)  # 16/4 = 4
+
+    def test_legacy_defaults_are_constant(self) -> None:
+        # No min_lr / weight_decay_end / final_momentum_teacher -> constant schedules.
+        config = self._base_config(output_name="legacy_constant")
+        trainer = DinoIBOTPretrainer(config)
+        try:
+            np.testing.assert_allclose(trainer.lr_schedule.schedule, config["lr"])
+            np.testing.assert_allclose(trainer.wd_schedule.schedule, 0.04)
+            np.testing.assert_allclose(trainer.momentum_schedule.schedule, 0.994)
         finally:
             trainer._close_auxiliary_datasets()
             trainer._finish_wandb()

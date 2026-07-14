@@ -772,7 +772,14 @@ class Eva(nn.Module):
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                x = checkpoint(
+                    blk,
+                    x,
+                    rope=rot_pos_embed,
+                    rope_shape=rope_shape,
+                    rope_coords=rope_coords,
+                    use_reentrant=False,
+                )
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         x = self.norm(x)
@@ -915,13 +922,27 @@ class EvaWithChunking(Eva):
         if self.chunked_blocks:
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(
+                        chunk,
+                        x,
+                        rope=rot_pos_embed,
+                        rope_shape=rope_shape,
+                        rope_coords=rope_coords,
+                        use_reentrant=False,
+                    )
                 else:
                     x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
-                    x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
+                    x = checkpoint(
+                        blk,
+                        x,
+                        rope=rot_pos_embed,
+                        rope_shape=rope_shape,
+                        rope_coords=rope_coords,
+                        use_reentrant=False,
+                    )
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         

@@ -10,10 +10,13 @@ import torch
 from .masking import MaskingGenerator3d
 
 
-def _as_3tuple(value: int | tuple[int, int, int]) -> tuple[int, int, int]:
+def _as_spatial_tuple(value: int | tuple[int, ...]) -> tuple[int, ...]:
     if isinstance(value, int):
         return (value, value, value)
-    return tuple(int(v) for v in value)
+    result = tuple(int(v) for v in value)
+    if len(result) not in (2, 3):
+        raise ValueError(f"expected 2 or 3 spatial values, got {result}")
+    return result
 
 
 def collate_dino_ibot_batch(
@@ -83,17 +86,47 @@ def collate_dino_ibot_batch(
         "n_local_views": n_local_views,
         "batch_size": len(samples),
     }
+    component_rows: list[int] = []
+    component_patch_indices: list[int] = []
+    component_group_ids: list[int] = []
+    component_sample_ids: list[int] = []
+    next_group_id = 0
+    for sample_index, sample in enumerate(samples):
+        constraints = sample.get("component_constraints") or []
+        group_remap: dict[int, int] = {}
+        for constraint in constraints:
+            raw_group_id = int(constraint["group_id"])
+            if raw_group_id not in group_remap:
+                group_remap[raw_group_id] = next_group_id
+                next_group_id += 1
+            view_index = int(constraint["view_index"])
+            component_rows.append(view_index * len(samples) + sample_index)
+            component_patch_indices.append(int(constraint["patch_index"]))
+            component_group_ids.append(group_remap[raw_group_id])
+            component_sample_ids.append(sample_index)
+    batch.update({
+        "component_rows": torch.tensor(component_rows, dtype=torch.long),
+        "component_patch_indices": torch.tensor(component_patch_indices, dtype=torch.long),
+        "component_group_ids": torch.tensor(component_group_ids, dtype=torch.long),
+        "component_sample_ids": torch.tensor(component_sample_ids, dtype=torch.long),
+    })
     if collated_gram_teacher_crops is not None:
         batch["collated_gram_teacher_crops"] = collated_gram_teacher_crops
     return batch
 
 
 def build_dino_ibot_collate_fn(config: Mapping[str, Any]) -> partial:
-    global_crop_size = _as_3tuple(config["global_crop_size"])
-    patch_size = _as_3tuple(config["patch_size"])
+    global_crop_size = _as_spatial_tuple(config["global_crop_size"])
+    patch_size = _as_spatial_tuple(config["patch_size"])
+    if len(global_crop_size) != len(patch_size):
+        raise ValueError(
+            f"global_crop_size and patch_size must have the same dimensionality, "
+            f"got {global_crop_size} and {patch_size}"
+        )
     feature_map_size = tuple(size // patch for size, patch in zip(global_crop_size, patch_size))
     n_tokens = math.prod(feature_map_size)
-    mask_generator = MaskingGenerator3d(feature_map_size)
+    mask_generator_size = feature_map_size if len(feature_map_size) == 3 else (1, *feature_map_size)
+    mask_generator = MaskingGenerator3d(mask_generator_size)
     return partial(
         collate_dino_ibot_batch,
         mask_ratio_min_max=tuple(config.get("mask_ratio_min_max", (0.1, 0.5))),

@@ -144,12 +144,12 @@ def _resolve_default_rope_type(config: Mapping[str, Any]) -> str:
     return "axial"
 
 
-def _as_3tuple(value: int | Tuple[int, int, int]) -> Tuple[int, int, int]:
+def _as_spatial_tuple(value: int | Tuple[int, ...]) -> Tuple[int, ...]:
     if isinstance(value, int):
         return (value, value, value)
     result = tuple(int(v) for v in value)
-    if len(result) != 3:
-        raise ValueError(f"expected 3 values and got {len(result)}: {result}")
+    if len(result) not in (2, 3):
+        raise ValueError(f"expected 2 or 3 spatial values and got {len(result)}: {result}")
     return result
 
 
@@ -232,16 +232,16 @@ def _materialize_backbone_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if impl_cls is rope_impl
     )
 
-    global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
+    global_crops_size = _as_spatial_tuple(backbone_config["global_crops_size"])
     local_crop_value = backbone_config["local_crops_size"] or global_crops_size
-    local_crops_size = _as_3tuple(local_crop_value)
+    local_crops_size = _as_spatial_tuple(local_crop_value)
 
     materialized = dict(backbone_config)
     materialized.update(
         {
             "global_crops_size": global_crops_size,
             "local_crops_size": local_crops_size,
-            "patch_size": _as_3tuple(backbone_config["patch_size"]),
+            "patch_size": _as_spatial_tuple(backbone_config["patch_size"]),
             "rope_type": rope_type,
             "rope_kwargs": dict(rope_kwargs),
         }
@@ -402,8 +402,8 @@ class DinoVitStudentTeacher(nn.Module):
     def _build_backbone(config: Mapping[str, Any]) -> nn.Module:
         backbone_config = _materialize_backbone_config(config)
         rope_impl, rope_kwargs = _resolve_rope_impl(config, backbone_config["rope_kwargs"])
-        global_crops_size = _as_3tuple(backbone_config["global_crops_size"])
-        local_crops_size = _as_3tuple(backbone_config["local_crops_size"])
+        global_crops_size = _as_spatial_tuple(backbone_config["global_crops_size"])
+        local_crops_size = _as_spatial_tuple(backbone_config["local_crops_size"])
         block_chunks = int(backbone_config["block_chunks"])
         backbone_cls = EvaWithChunking if block_chunks > 0 else Eva
         kwargs = dict(backbone_config)
@@ -411,7 +411,7 @@ class DinoVitStudentTeacher(nn.Module):
             {
                 "global_crops_size": global_crops_size,
                 "local_crops_size": local_crops_size,
-                "patch_size": _as_3tuple(backbone_config["patch_size"]),
+                "patch_size": _as_spatial_tuple(backbone_config["patch_size"]),
                 "rope_impl": rope_impl,
                 "rope_kwargs": rope_kwargs,
             }
@@ -677,7 +677,42 @@ class DinoVitStudentTeacher(nn.Module):
         return_teacher: bool = True,
         project_student_patch_tokens: bool = False,
         project_teacher_patch_tokens: bool = False,
+        forward_phase: Optional[str] = None,
     ) -> dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]]:
+        if forward_phase == "teacher_global":
+            teacher_source = student_input if teacher_input is None else teacher_input
+            with torch.inference_mode():
+                teacher_outputs = self._forward_branch(
+                    self.teacher,
+                    teacher_source,
+                    masks=teacher_masks,
+                    project_cls_tokens=False,
+                    view_kind="global",
+                )
+                teacher_global = dict(teacher_outputs)
+                teacher_global_cls, teacher_patch = self.project_global_cls_and_masked_patch_tokens(
+                    self.teacher,
+                    teacher_global["cls_tokens"],
+                    teacher_global["patch_tokens"],
+                    mask_indices_list,
+                    n_masked_patches=n_masked_patches,
+                )
+            return {"teacher": {
+                "global": teacher_global,
+                "global_cls_projections": teacher_global_cls,
+                "global_masked_patch_projections": teacher_patch,
+            }}
+        if forward_phase == "student_local":
+            return {"student": self._forward_branch(
+                self.student,
+                student_input,
+                masks=None,
+                project_cls_tokens=True,
+                view_kind="local",
+            )}
+        if forward_phase not in (None, "student_global"):
+            raise ValueError(f"unsupported forward_phase={forward_phase!r}")
+
         project_cls_tokens = mask_indices_list is None
         student_outputs = self._forward_branch(
             self.student,
@@ -715,7 +750,7 @@ class DinoVitStudentTeacher(nn.Module):
                 )
             outputs = {"student": structured_student_outputs}
 
-        if return_teacher:
+        if return_teacher and forward_phase is None:
             teacher_source = student_input if teacher_input is None else teacher_input
             with torch.no_grad():
                 teacher_outputs = self._forward_branch(

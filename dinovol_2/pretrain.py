@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 import random
 from typing import Any, Iterator, Mapping
@@ -19,12 +21,13 @@ from tqdm.auto import tqdm
 from PIL import Image
 
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
+from dinovol_2.dataset.ssl_2d_dataset import SSLZarrSliceDataset, PairedTiffComponentDataset
 
 from dinovol_2.eval.task_eval import TaskEvalRunner
 from dinovol_2.ops.collate import build_dino_ibot_collate_fn
 from dinovol_2.ops.distributed_utils import build_distributed_sampler, resolve_distributed_config
 from dinovol_2.ops.weighted_loader import WeightedCombinedLoader
-from dinovol_2.loss import DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
+from dinovol_2.loss import ComponentContrastiveLoss, DINOLoss, GramLoss, KoLeoLoss, iBOTPatchLoss
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 
 
@@ -34,22 +37,25 @@ def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, flo
     return float(value[0]), float(value[1])
 
 
-def _as_3tuple(value: Any) -> tuple[int, int, int] | None:
+def _as_spatial_tuple(value: Any) -> tuple[int, ...] | None:
     if value is None:
         return None
     if isinstance(value, int):
         return (value, value, value)
     result = tuple(int(v) for v in value)
-    if len(result) != 3:
-        raise ValueError(f"Expected 3 values, got {result}")
+    if len(result) not in (2, 3):
+        raise ValueError(f"Expected 2 or 3 spatial values, got {result}")
     return result
 
 
-def _max_3tuple(*values: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+def _max_spatial_tuple(*values: tuple[int, ...] | None) -> tuple[int, ...] | None:
     filtered = [value for value in values if value is not None]
     if not filtered:
         return None
-    return tuple(max(int(value[axis]) for value in filtered) for axis in range(3))
+    ndim = len(filtered[0])
+    if any(len(value) != ndim for value in filtered):
+        raise ValueError(f"spatial dimensionality mismatch: {filtered}")
+    return tuple(max(int(value[axis]) for value in filtered) for axis in range(ndim))
 
 
 def _config_get(config: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
@@ -112,6 +118,55 @@ class CosineScheduler:
         return float(self.schedule[step])
 
 
+def linear_warmup_cosine_decay(
+        *,
+        start: float,
+        peak: float,
+        end: float,
+        warmup_iters: int,
+        total_iters: int,
+        cosine_iters: int | None = None,
+) -> np.ndarray:
+    """DINOv3-style schedule: linear warmup -> optional cosine decay -> constant tail.
+
+    Ported from facebookresearch/dinov3 (dinov3/train/cosine_lr_scheduler.py). When
+    ``cosine_iters`` is ``None`` the cosine phase spans everything after warmup; if
+    ``peak == end`` this degenerates to a constant value, which is the DINOv3 default
+    for lr / weight decay / teacher momentum.
+    """
+    warmup_iters = max(0, min(int(warmup_iters), int(total_iters)))
+    linear = np.linspace(start, peak, warmup_iters, endpoint=False, dtype=np.float64)
+    if cosine_iters is None:
+        cosine_iters = total_iters - warmup_iters
+    cosine_iters = max(0, min(int(cosine_iters), total_iters - warmup_iters))
+    cosine = (np.cos(np.linspace(0, np.pi, cosine_iters, dtype=np.float64)) + 1.0) / 2.0
+    cosine = (peak - end) * cosine + end
+    remaining_iters = total_iters - cosine_iters - warmup_iters
+    if remaining_iters < 0:
+        raise AssertionError("invalid scheduler length")
+    constant = np.full((remaining_iters,), fill_value=float(end), dtype=np.float64)
+    return np.concatenate([linear, cosine, constant])
+
+
+class ArraySchedule:
+    """Wraps a precomputed schedule array with CosineScheduler-compatible indexing."""
+
+    def __init__(self, schedule: np.ndarray, *, final_value: float | None = None) -> None:
+        self.schedule = np.asarray(schedule, dtype=np.float64)
+        self.total_iters = int(len(self.schedule))
+        if final_value is not None:
+            self.final_value = float(final_value)
+        elif self.total_iters > 0:
+            self.final_value = float(self.schedule[-1])
+        else:
+            self.final_value = 0.0
+
+    def __getitem__(self, step: int) -> float:
+        if step >= self.total_iters:
+            return self.final_value
+        return float(self.schedule[step])
+
+
 class DinoIBOTPretrainer:
     def __init__(self, config: Mapping[str, Any]) -> None:
         self.config = dict(config)
@@ -154,13 +209,18 @@ class DinoIBOTPretrainer:
         self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
         self.total_steps = self.max_iterations
         self.base_lr = float(self.config.get("lr", 1e-4))
-        self.min_lr = float(self.config.get("min_lr", 1e-6))
+        # DINOv3-style constant-by-default: when the "end" values are omitted the
+        # schedules stay flat (only teacher-temp keeps a warmup). Set min_lr /
+        # weight_decay_end / final_momentum_teacher explicitly to recover cosine decay.
+        self.min_lr = float(self.config.get("min_lr", self.base_lr))
         self.base_weight_decay = float(self.config.get("weight_decay", 0.04))
-        self.final_weight_decay = float(self.config.get("weight_decay_end", 0.4))
+        self.final_weight_decay = float(self.config.get("weight_decay_end", self.base_weight_decay))
         self.betas = tuple(self.config.get("betas", (0.9, 0.999)))
         self.clip_grad = float(self.config.get("clip_grad", 3.0))
         self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
         self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 0.2))
+        self.scaling_rule = str(self.config.get("scaling_rule", "none"))
+        self.schedule_batch_size = int(self.config.get("batch_size", 1))
         
         warmup_ratio = float(self.config.get("warmup_ratio", 0.1))
         default_warmup_steps = 0
@@ -176,6 +236,7 @@ class DinoIBOTPretrainer:
             ddp_kwargs: dict[str, Any] = {
                 "broadcast_buffers": False,
                 "find_unused_parameters": False,
+                "gradient_as_bucket_view": True,
             }
             if self.device.type == "cuda":
                 ddp_kwargs.update(
@@ -198,6 +259,12 @@ class DinoIBOTPretrainer:
             masked_loss_chunk_size=masked_loss_chunk_size,
         ).to(self.device)
         self.koleo_loss = KoLeoLoss().to(self.device)
+        self.component_config = dict(self.config.get("component_contrast") or {})
+        self.component_loss_weight = float(self.component_config.get("loss_weight", 0.1))
+        self.do_component = bool(self.component_config.get("enabled", False)) and self.component_loss_weight > 0.0
+        self.component_loss = ComponentContrastiveLoss(
+            temperature=float(self.component_config.get("temperature", 0.1))
+        ).to(self.device)
         self.gram_config = dict(self.config.get("gram") or {})
         self.do_gram = bool(self.gram_config.get("enabled", False))
         self.gram_loss = (
@@ -237,8 +304,8 @@ class DinoIBOTPretrainer:
         self.warmup_teacher_temp_steps = int(
             self.config.get("warmup_teacher_temp_steps", round(self.total_steps * 0.3))
         )
-        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.992))
-        self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", 1.0))
+        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.994))
+        self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", self.momentum_teacher))
         (
             self.lr_schedule,
             self.wd_schedule,
@@ -248,7 +315,7 @@ class DinoIBOTPretrainer:
         ) = self._build_schedulers()
         
         self.log_every = int(self.config.get("log_every", 20))
-        self.val_every_n = int(self.config.get("val_every_n", 0))
+        self.monitor_every_n = int(self.config.get("monitor_every_n", self.config.get("val_every_n", 0)))
         self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
         self.monitor_batch_size = max(5, int(self.config.get("monitor_batch_size", 5)))
         self.monitor_pool_size = max(1, int(self.config.get("monitor_pool_size", 5000)))
@@ -262,7 +329,6 @@ class DinoIBOTPretrainer:
         self.wandb_run_name = _config_get(self.config, "wandb-run-name", "wandb_run_name")
         self.wandb_run_id = _config_get(self.config, "wandb-run-id", "wandb_run_id")
         self._wandb: Any | None = None
-        self._warned_missing_val_dataset = False
         self.resume = bool(self.config.get("resume", False))
         self.auto_resume = bool(self.config.get("auto_resume", self.resume or bool(self.config.get("resume_from"))))
         self.resume_path = self._resolve_resume_path()
@@ -270,12 +336,11 @@ class DinoIBOTPretrainer:
         self.wandb_resume = self._normalize_wandb_resume_mode(
             configured_wandb_resume if configured_wandb_resume is not None else ("allow" if self.resume_path is not None else None)
         )
-        self._monitor_dataset: SSLZarrDataset | None = None
+        self._monitor_dataset: Any | None = None
         self._monitor_collate_fn: Any | None = None
         self._monitor_seed_pool = tuple(self.monitor_seed + offset for offset in range(self.monitor_pool_size))
         self._monitor_selection_rng = random.Random(self.monitor_seed)
         self._train_sampler_epoch = 0
-        self._val_sampler_epoch = 0
         self.task_eval_every = int(self.config.get("task_eval_every", 0))
         self._task_evaluator = (
             TaskEvalRunner(
@@ -356,6 +421,55 @@ class DinoIBOTPretrainer:
         if self.total_steps <= 0 or freeze_ratio <= 0.0:
             return 0
         return max(1, min(self.total_steps, round(self.total_steps * freeze_ratio)))
+
+    def _lr_scale_factor(self) -> float:
+        """Batch-size LR scaling, self-relative to our own global effective batch.
+
+        Same spirit as DINOv3's rule, but anchored to *our* reference batch instead
+        of their fixed 1024/256 constants: you specify ``lr`` (or schedules ``peak``)
+        at ``lr_reference_batch_size`` and it is rescaled by the ratio of the current
+        global effective batch (``batch_size * world_size``) to that reference.
+
+        - ``sqrt``   -> factor = sqrt(effective_batch / reference)
+        - ``linear`` -> factor = effective_batch / reference
+        - ``none``   -> 1.0 (LR used verbatim; the default)
+
+        ``lr_reference_batch_size`` defaults to the current effective batch, so the
+        factor is 1.0 until you declare the batch your LR was tuned at.
+        """
+        rule = (self.scaling_rule or "none").lower()
+        if rule in {"none", "", "constant"}:
+            return 1.0
+        effective_batch = max(1, self.schedule_batch_size * max(1, self.world_size))
+        reference_batch = int(self.config.get("lr_reference_batch_size", effective_batch))
+        if reference_batch <= 0:
+            raise ValueError(f"lr_reference_batch_size must be positive, got {reference_batch}.")
+        ratio = effective_batch / reference_batch
+        if rule == "linear":
+            return ratio
+        if rule == "sqrt":
+            return math.sqrt(ratio)
+        raise ValueError(
+            f"Unknown scaling_rule {self.scaling_rule!r}; expected one of "
+            "'none', 'sqrt', 'linear'."
+        )
+
+    def _resolve_schedule_duration(self, spec: Mapping[str, Any], key: str, *, default_ratio: float = 0.0) -> int:
+        """Resolve a warmup/freeze duration from *_steps, *_epochs, or *_ratio."""
+        steps_key = f"{key}_steps"
+        epochs_key = f"{key}_epochs"
+        ratio_key = f"{key}_ratio"
+        if steps_key in spec:
+            return int(spec[steps_key])
+        if epochs_key in spec:
+            epoch_length = self.config.get("official_epoch_length", self.config.get("epoch_length"))
+            if epoch_length is None:
+                raise ValueError(f"schedules '{epochs_key}' requires official_epoch_length or epoch_length in the config.")
+            return int(spec[epochs_key]) * int(epoch_length)
+        ratio = float(spec.get(ratio_key, default_ratio))
+        if self.total_steps <= 0 or ratio <= 0.0:
+            return 0
+        return max(1, min(self.total_steps, round(self.total_steps * ratio)))
 
     @staticmethod
     def _normalize_wandb_resume_mode(value: Any) -> str | None:
@@ -446,11 +560,19 @@ class DinoIBOTPretrainer:
             betas=self.betas,
         )
     
-    def _build_schedulers(self) -> tuple[
-        CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler, CosineScheduler]:
+    def _build_schedulers(self):
+        if "schedules" in self.config and self.config["schedules"]:
+            return self._build_schedulers_v2()
+
+        lr_scale = self._lr_scale_factor()
+        base_lr = self.base_lr * lr_scale
+        min_lr = self.min_lr * lr_scale
+        if lr_scale != 1.0 and self.is_main_process:
+            print(f"scaling_rule {self.scaling_rule}: lr {self.base_lr} -> {base_lr}")
+
         lr_schedule = CosineScheduler(
-            base_value=self.base_lr,
-            final_value=self.min_lr,
+            base_value=base_lr,
+            final_value=min_lr,
             total_iters=self.total_steps,
             warmup_iters=self.warmup_steps,
             start_warmup_value=0.0,
@@ -473,13 +595,110 @@ class DinoIBOTPretrainer:
             start_warmup_value=self.warmup_teacher_temp,
         )
         last_layer_lr_schedule = CosineScheduler(
-            base_value=self.base_lr,
-            final_value=self.min_lr,
+            base_value=base_lr,
+            final_value=min_lr,
             total_iters=self.total_steps,
             warmup_iters=self.warmup_steps,
             start_warmup_value=0.0,
         )
         last_layer_lr_schedule.schedule[: self.freeze_last_layer_steps] = 0.0
+        return (
+            lr_schedule,
+            wd_schedule,
+            momentum_schedule,
+            teacher_temp_schedule,
+            last_layer_lr_schedule,
+        )
+
+    def _build_schedulers_v2(self):
+        """DINOv3-style ``schedules`` block: constant-by-default with linear warmup.
+
+        Mirrors dinov3/train/train.py::build_schedulers_v2. Each quantity accepts
+        ``start``/``peak``/``end`` plus a warmup duration (``warmup_epochs`` /
+        ``warmup_steps`` / ``warmup_ratio``); cosine decay is opt-in via
+        ``cosine_epochs`` / ``cosine_steps`` (otherwise the tail is constant at
+        ``end``). Defaults reproduce dinov3_vit7b16_pretrain.yaml.
+        """
+        schedules = dict(self.config["schedules"])
+        total = self.total_steps
+
+        def _spec(name: str) -> dict:
+            return dict(schedules.get(name) or {})
+
+        def _cosine_iters(spec: Mapping[str, Any]) -> int | None:
+            if "cosine_steps" in spec:
+                return int(spec["cosine_steps"])
+            if "cosine_epochs" in spec:
+                epoch_length = self.config.get("official_epoch_length", self.config.get("epoch_length"))
+                if epoch_length is None:
+                    raise ValueError("schedules 'cosine_epochs' requires official_epoch_length or epoch_length.")
+                return int(spec["cosine_epochs"]) * int(epoch_length)
+            return None
+
+        lr_scale = self._lr_scale_factor()
+
+        lr_spec = _spec("lr")
+        raw_peak = float(lr_spec.get("peak", 5.0e-5))
+        raw_end = float(lr_spec.get("end", raw_peak))
+        lr_peak = raw_peak * lr_scale
+        lr_end = raw_end * lr_scale
+        if lr_scale != 1.0 and self.is_main_process:
+            print(f"scaling_rule {self.scaling_rule}: lr peak {raw_peak} -> {lr_peak}")
+        lr_array = linear_warmup_cosine_decay(
+            start=float(lr_spec.get("start", 0.0)),
+            peak=lr_peak,
+            end=lr_end,
+            warmup_iters=self._resolve_schedule_duration(lr_spec, "warmup", default_ratio=0.1),
+            total_iters=total,
+            cosine_iters=_cosine_iters(lr_spec),
+        )
+        lr_schedule = ArraySchedule(lr_array, final_value=lr_end)
+
+        freeze_steps = self._resolve_schedule_duration(lr_spec, "freeze_last_layer", default_ratio=0.005)
+        last_layer_array = lr_array.copy()
+        last_layer_array[:freeze_steps] = 0.0
+        last_layer_lr_schedule = ArraySchedule(last_layer_array, final_value=lr_end)
+
+        wd_spec = _spec("weight_decay")
+        wd_peak = float(wd_spec.get("peak", 0.04))
+        wd_schedule = ArraySchedule(
+            linear_warmup_cosine_decay(
+                start=float(wd_spec.get("start", wd_peak)),
+                peak=wd_peak,
+                end=float(wd_spec.get("end", wd_peak)),
+                warmup_iters=self._resolve_schedule_duration(wd_spec, "warmup", default_ratio=0.0),
+                total_iters=total,
+                cosine_iters=_cosine_iters(wd_spec),
+            )
+        )
+
+        mom_spec = _spec("momentum")
+        mom_peak = float(mom_spec.get("peak", 0.994))
+        momentum_schedule = ArraySchedule(
+            linear_warmup_cosine_decay(
+                start=float(mom_spec.get("start", mom_peak)),
+                peak=mom_peak,
+                end=float(mom_spec.get("end", mom_peak)),
+                warmup_iters=self._resolve_schedule_duration(mom_spec, "warmup", default_ratio=0.0),
+                total_iters=total,
+                cosine_iters=_cosine_iters(mom_spec),
+            )
+        )
+
+        temp_spec = _spec("teacher_temp")
+        temp_peak = float(temp_spec.get("peak", 0.07))
+        teacher_temp_schedule = ArraySchedule(
+            linear_warmup_cosine_decay(
+                start=float(temp_spec.get("start", 0.04)),
+                peak=temp_peak,
+                end=float(temp_spec.get("end", temp_peak)),
+                warmup_iters=self._resolve_schedule_duration(temp_spec, "warmup", default_ratio=0.1),
+                total_iters=total,
+                cosine_iters=_cosine_iters(temp_spec),
+            ),
+            final_value=temp_peak,
+        )
+
         return (
             lr_schedule,
             wd_schedule,
@@ -540,6 +759,15 @@ class DinoIBOTPretrainer:
             return None
 
         base_config = dict(dataset_config)
+        sources = base_config.pop("sources", None)
+        if sources:
+            resolved_sources: list[dict[str, Any]] = []
+            for source in sources:
+                source_overrides = {name: value for name, value in dict(source).items() if name != "weight"}
+                merged_config = dict(base_config)
+                merged_config.update(source_overrides)
+                resolved_sources.append(self._prepare_dataset_config(merged_config))
+            return resolved_sources
         variants = base_config.pop("variants", None)
         if not variants:
             return [self._prepare_dataset_config(base_config)]
@@ -556,10 +784,13 @@ class DinoIBOTPretrainer:
         dataset_config = self.config.get(key)
         if dataset_config is None:
             return None
+        sources = dataset_config.get("sources")
+        if sources:
+            return tuple(float(dict(source).get("weight", 1.0)) for source in sources)
         variants = dataset_config.get("variants")
-        if not variants:
-            return None
-        return tuple(float(dict(variant).get("ratio", 1.0)) for variant in variants)
+        if variants:
+            return tuple(float(dict(variant).get("ratio", 1.0)) for variant in variants)
+        return None
 
     def _dataset_config(self, key: str) -> Mapping[str, Any] | None:
         resolved_configs = self._resolved_dataset_configs(key)
@@ -599,16 +830,16 @@ class DinoIBOTPretrainer:
         backbone = self.model_module.student.backbone
         halo_voxels = tuple(int(tokens) * int(size) for tokens, size in zip(backbone.deeper_embed_patch_halo, backbone.patch_size))
 
-        def _view_size(crop_size: tuple[int, int, int] | None) -> tuple[int, int, int] | None:
+        def _view_size(crop_size: tuple[int, ...] | None) -> tuple[int, ...] | None:
             if crop_size is None:
                 return None
             return tuple(int(dim) + 2 * int(halo) for dim, halo in zip(crop_size, halo_voxels))
 
-        global_crop_size = _as_3tuple(dataset_config.get("global_crop_size", dataset_config.get("crop_size")))
+        global_crop_size = _as_spatial_tuple(dataset_config.get("global_crop_size", dataset_config.get("crop_size")))
         global_view_size = _view_size(global_crop_size)
-        local_crop_size = _as_3tuple(dataset_config.get("local_crop_size"))
+        local_crop_size = _as_spatial_tuple(dataset_config.get("local_crop_size"))
         local_view_size = _view_size(local_crop_size)
-        gram_teacher_crop_size = _as_3tuple(dataset_config.get("gram_teacher_crop_size"))
+        gram_teacher_crop_size = _as_spatial_tuple(dataset_config.get("gram_teacher_crop_size"))
         gram_teacher_view_size = _view_size(gram_teacher_crop_size)
 
         overrides: dict[str, Any] = {
@@ -618,10 +849,10 @@ class DinoIBOTPretrainer:
             overrides["local_view_size"] = local_view_size
         if gram_teacher_view_size is not None:
             overrides["gram_teacher_view_size"] = gram_teacher_view_size
-        source_sampling_size = _as_3tuple(
+        source_sampling_size = _as_spatial_tuple(
             dataset_config.get("source_sampling_size", dataset_config.get("source_crop_size"))
         )
-        required_source_sampling_size = _max_3tuple(
+        required_source_sampling_size = _max_spatial_tuple(
             global_crop_size,
             local_crop_size,
             gram_teacher_crop_size,
@@ -631,8 +862,25 @@ class DinoIBOTPretrainer:
             overrides["source_sampling_size"] = required_source_sampling_size
         return overrides
 
+    def _build_ssl_dataset(self, dataset_config: Mapping[str, Any], *, do_augmentations: bool):
+        resolved_dataset_config = dict(dataset_config)
+        resolved_dataset_config.setdefault("patch_size", self.model_config.get("patch_size", (16, 16, 16)))
+        dataset_type = str(resolved_dataset_config.get("type", "zarr_3d")).lower()
+        if dataset_type in {"zarr_manifest_2d", "zarr_slice_2d"}:
+            if self.do_gram:
+                raise ValueError("Gram anchoring is not currently supported by the 2D manifest dataset.")
+            return SSLZarrSliceDataset(resolved_dataset_config, do_augmentations=do_augmentations)
+        elif dataset_type in {"paired_tiff_components", "tiff_components"}:
+            if self.do_gram:
+                raise ValueError("Gram anchoring is not currently supported by the paired TIFF dataset.")
+            return PairedTiffComponentDataset(resolved_dataset_config, do_augmentations=do_augmentations)
+        elif dataset_type in {"zarr_3d", "zarr"}:
+            return SSLZarrDataset(resolved_dataset_config, do_augmentations=do_augmentations)
+        else:
+            raise ValueError(f"unsupported dataset type: {dataset_type!r}")
+
     def _build_ssl_dataloader(self, dataset_config: Mapping[str, Any], *, shuffle: bool) -> DataLoader:
-        dataset = SSLZarrDataset(dataset_config, do_augmentations=True)
+        dataset = self._build_ssl_dataset(dataset_config, do_augmentations=True)
         collate_fn = build_dino_ibot_collate_fn(
             {
                 "global_crop_size": dataset.global_crop_size,
@@ -684,21 +932,6 @@ class DinoIBOTPretrainer:
             dataset_configs,
             shuffle=bool(self.config.get("shuffle", False)),
             weights=self._dataset_variant_weights("dataset"),
-        )
-
-    def build_val_dataloader(self) -> DataLoader | WeightedCombinedLoader | None:
-        val_dataset_configs = self._resolved_dataset_configs("val_dataset")
-        val_weights = self._dataset_variant_weights("val_dataset")
-        if val_dataset_configs is None:
-            train_dataset_configs = self._resolved_dataset_configs("dataset")
-            if train_dataset_configs is None or len(train_dataset_configs) <= 1:
-                return None
-            val_dataset_configs = [dict(train_dataset_configs[0])]
-            val_weights = None
-        return self._build_loader_from_configs(
-            val_dataset_configs,
-            shuffle=False,
-            weights=val_weights,
         )
 
     @staticmethod
@@ -783,7 +1016,7 @@ class DinoIBOTPretrainer:
         self._wandb = wandb
         self._wandb.define_metric("trainer/step", hidden=True)
         self._wandb.define_metric("train/*", step_metric="trainer/step")
-        self._wandb.define_metric("val/*", step_metric="trainer/step")
+        self._wandb.define_metric("monitor/*", step_metric="trainer/step")
         self._wandb.define_metric("task_eval/*", step_metric="trainer/step")
         self.wandb_run_id = self._current_wandb_run_id()
         if self.wandb_run_id is not None:
@@ -819,13 +1052,13 @@ class DinoIBOTPretrainer:
         if self._wandb_enabled():
             self._wandb.finish()
     
-    def _get_monitor_source(self) -> tuple[SSLZarrDataset, Any]:
+    def _get_monitor_source(self) -> tuple[Any, Any]:
         if self._monitor_dataset is None or self._monitor_collate_fn is None:
             monitor_dataset_config = self.config.get("monitor_dataset")
             if monitor_dataset_config is None:
-                monitor_dataset_config = self.config.get("val_dataset", self.config["dataset"])
-            monitor_dataset_config = self._dataset_config("monitor_dataset") or self._dataset_config("val_dataset") or self._dataset_config("dataset")
-            dataset = SSLZarrDataset(monitor_dataset_config, do_augmentations=True)
+                monitor_dataset_config = self.config["dataset"]
+            monitor_dataset_config = self._dataset_config("monitor_dataset") or self._dataset_config("dataset")
+            dataset = self._build_ssl_dataset(monitor_dataset_config, do_augmentations=True)
             collate_fn = build_dino_ibot_collate_fn(
                 {
                     "global_crop_size": dataset.global_crop_size,
@@ -1063,6 +1296,61 @@ class DinoIBOTPretrainer:
             mask_indices_list=mask_indices,
             n_masked_patches=n_masked,
             return_teacher=return_teacher,
+        )
+
+    def _forward_teacher_global(
+        self,
+        global_crops: torch.Tensor,
+        mask_indices: torch.Tensor,
+        n_masked: int,
+    ) -> Mapping[str, Any]:
+        return self.model(
+            student_input=global_crops,
+            teacher_input=global_crops,
+            mask_indices_list=mask_indices,
+            n_masked_patches=n_masked,
+            forward_phase="teacher_global",
+        )["teacher"]
+
+    def _forward_student_global(
+        self,
+        global_crops: torch.Tensor,
+        masks: torch.Tensor,
+        mask_indices: torch.Tensor,
+        n_masked: int,
+    ) -> Mapping[str, Any]:
+        return self.model(
+            student_input=global_crops,
+            student_masks=masks,
+            mask_indices_list=mask_indices,
+            n_masked_patches=n_masked,
+            return_teacher=False,
+            forward_phase="student_global",
+        )["student"]
+
+    def _forward_student_local(self, local_crops: torch.Tensor) -> Mapping[str, torch.Tensor]:
+        return self.model(
+            student_input=local_crops,
+            return_teacher=False,
+            forward_phase="student_local",
+        )["student"]
+
+    def _compute_component_loss(
+        self,
+        *,
+        patch_tokens: torch.Tensor,
+        masks: torch.Tensor,
+        batch: Mapping[str, Any],
+    ) -> torch.Tensor:
+        if not self.do_component:
+            return patch_tokens.sum() * 0.0
+        return self.component_loss(
+            patch_tokens,
+            rows=batch.get("component_rows", torch.empty(0, dtype=torch.long)),
+            patch_indices=batch.get("component_patch_indices", torch.empty(0, dtype=torch.long)),
+            group_ids=batch.get("component_group_ids", torch.empty(0, dtype=torch.long)),
+            sample_ids=batch.get("component_sample_ids", torch.empty(0, dtype=torch.long)),
+            masks=masks,
         )
 
     def verify_batch_pipeline(self, batch: Mapping[str, Any], step: int = 0) -> dict[str, Any]:
@@ -1393,7 +1681,8 @@ class DinoIBOTPretrainer:
         lr, weight_decay, teacher_momentum, teacher_temp = self._apply_optim_scheduler(step)
 
         global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
-        local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
+        # Keep local views on the host and transfer/consume them one view at a time.
+        local_crops = batch["collated_local_crops"]
         gram_teacher_crops = batch.get("collated_gram_teacher_crops")
         if gram_teacher_crops is not None:
             gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
@@ -1406,50 +1695,55 @@ class DinoIBOTPretrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            model_outputs = self._forward_model(
-                global_crops=global_crops,
-                local_crops=local_crops if n_local_views else None,
-                masks=masks,
-                mask_indices=mask_indices,
-                n_masked=n_masked,
-                return_teacher=self.do_dino or self.do_ibot,
-            )
-            teacher_branch = model_outputs.get("teacher")
-            if self.do_dino and teacher_branch is not None:
-                teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
-                    teacher_branch["global_cls_projections"],
-                    teacher_temp,
-                )
-            else:
-                teacher_cls_0 = teacher_cls_1 = None
-            if self.do_ibot and teacher_branch is not None:
-                teacher_patch_targets = self._center_teacher_patch(
-                    teacher_branch["global_masked_patch_projections"],
-                    teacher_temp,
-                )
-            else:
-                teacher_patch_targets = None
+        teacher_cls_0 = teacher_cls_1 = teacher_patch_targets = None
+        if self.do_dino or self.do_ibot:
+            with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                teacher_branch = self._forward_teacher_global(global_crops, mask_indices, n_masked)
+                if self.do_dino:
+                    teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
+                        teacher_branch["global_cls_projections"], teacher_temp
+                    )
+                if self.do_ibot:
+                    teacher_patch_targets = self._center_teacher_patch(
+                        teacher_branch["global_masked_patch_projections"], teacher_temp
+                    )
+            # Do not overlap teacher backbone outputs/logits with student activations.
+            del teacher_branch
 
-            student_branch = model_outputs["student"]
+        total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
+        dino_local_loss_value = global_crops.new_zeros(())
+        if self.do_dino and n_local_views:
+            batch_size = int(batch["batch_size"])
+            for view_index in range(n_local_views):
+                start = view_index * batch_size
+                local_view = local_crops[start:start + batch_size].to(self.device, non_blocking=True)
+                # Delay DDP synchronization until the final global backward pass.
+                sync_context = self.model.no_sync() if isinstance(self.model, DDP) else nullcontext()
+                with sync_context:
+                    with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                        local_output = self._forward_student_local(local_view)
+                        local_view_loss = self.dino_loss(
+                            [local_output["cls_projections"]], [teacher_cls_0, teacher_cls_1]
+                        ) / total_terms
+                        weighted_local_loss = self.dino_loss_weight * local_view_loss
+                    self.scaler.scale(weighted_local_loss).backward()
+                dino_local_loss_value += local_view_loss.detach()
+                del local_view, local_output, local_view_loss, weighted_local_loss
+
+        with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+            student_branch = self._forward_student_global(global_crops, masks, mask_indices, n_masked)
             student_global = student_branch["global"]
             student_global_cls = student_branch["global_cls_projections"]
             student_patch = student_branch["global_masked_patch_projections"]
             global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
 
-            total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
             if self.do_dino:
                 dino_global_loss = (
                     self.dino_loss([global_cls_0], [teacher_cls_1]) +
                     self.dino_loss([global_cls_1], [teacher_cls_0])
                 ) / total_terms
 
-                if n_local_views:
-                    student_local = student_branch["local"]
-                    local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
-                    dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
-                else:
-                    dino_local_loss = global_crops.new_zeros(())
+                dino_local_loss = dino_local_loss_value
             else:
                 dino_global_loss = global_crops.new_zeros(())
                 dino_local_loss = global_crops.new_zeros(())
@@ -1474,12 +1768,18 @@ class DinoIBOTPretrainer:
                 global_crops=global_crops,
                 gram_teacher_crops=gram_teacher_crops,
             )
+            component_loss = self._compute_component_loss(
+                patch_tokens=student_global["patch_tokens"],
+                masks=masks,
+                batch=batch,
+            )
 
             loss = (
-                self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
+                self.dino_loss_weight * dino_global_loss +
                 self.ibot_loss_weight * ibot_loss +
                 self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
+                self.gram_loss_weight * gram_loss +
+                self.component_loss_weight * component_loss
             )
 
         self.scaler.scale(loss).backward()
@@ -1491,13 +1791,15 @@ class DinoIBOTPretrainer:
         self._maybe_refresh_gram_teacher(step)
 
         return {
-            "loss": float(loss.detach()),
+            "loss": float((loss.detach() + self.dino_loss_weight * dino_local_loss).detach()),
             "dino_global_loss": float(dino_global_loss.detach()),
             "dino_local_loss": float(dino_local_loss.detach()),
             "ibot_loss": float(ibot_loss.detach()),
             "koleo_loss": float(koleo_loss.detach()),
             "gram_loss": float(gram_loss.detach()),
             "gram_loss_weight": float(self.gram_loss_weight),
+            "component_loss": float(component_loss.detach()),
+            "component_loss_weight": float(self.component_loss_weight),
             "lr": lr,
             "weight_decay": weight_decay,
             "teacher_temp": teacher_temp,
@@ -1621,7 +1923,7 @@ class DinoIBOTPretrainer:
         patch_tokens: torch.Tensor,
         sample_index: int,
         target_hw: tuple[int, int],
-        input_spatial_shape: tuple[int, int, int],
+        input_spatial_shape: tuple[int, ...],
     ) -> np.ndarray:
         feature_shape = self._feature_map_shape(
             self.model_module.student.backbone,
@@ -1629,8 +1931,11 @@ class DinoIBOTPretrainer:
             view_kind="global",
         )
         feature_map = patch_tokens[sample_index].reshape(*feature_shape, patch_tokens.shape[-1])
-        depth = feature_map.shape[0] // 2
-        slice_features = feature_map[depth].float()
+        if len(feature_shape) == 2:
+            slice_features = feature_map.float()
+        else:
+            depth = feature_map.shape[0] // 2
+            slice_features = feature_map[depth].float()
         h, w, c = slice_features.shape
         flat = slice_features.reshape(h * w, c)
         flat = flat - flat.mean(dim=0)
@@ -1683,109 +1988,11 @@ class DinoIBOTPretrainer:
             f"step={step} monitor_image={image_path.name} "
             f"loss={metrics['loss']:.4f} glob={metrics['dino_global_loss']:.4f} "
             f"loc={metrics['dino_local_loss']:.4f} ibot={metrics['ibot_loss']:.4f} "
-            f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f}"
+            f"koleo={metrics['koleo_loss']:.4f} gram={metrics['gram_loss']:.4f} "
+            f"component={metrics['component_loss']:.4f}"
         )
         return image_path
     
-    def validate(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
-        self.model.eval()
-        teacher_temp = self._teacher_temp(step)
-
-        global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
-        local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
-        gram_teacher_crops = batch.get("collated_gram_teacher_crops")
-        if gram_teacher_crops is not None:
-            gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
-        masks = batch["collated_masks"].to(self.device, non_blocking=True)
-        mask_indices = batch["mask_indices_list"].to(self.device, non_blocking=True)
-        masks_weight = batch["masks_weight"].to(self.device, non_blocking=True)
-        n_global_views = int(batch["n_global_views"])
-        n_local_views = int(batch["n_local_views"])
-        n_masked = int(batch["n_masked_patches"].item())
-
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
-            model_outputs = self._forward_model(
-                global_crops=global_crops,
-                local_crops=local_crops if n_local_views else None,
-                masks=masks,
-                mask_indices=mask_indices,
-                n_masked=n_masked,
-                return_teacher=self.do_dino or self.do_ibot,
-            )
-            teacher_branch = model_outputs.get("teacher")
-            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
-                teacher_branch["global_cls_projections"],
-                teacher_temp,
-                update_centers=False,
-            ) if self.do_dino and teacher_branch is not None else (None, None)
-            teacher_patch_targets = self._center_teacher_patch(
-                teacher_branch["global_masked_patch_projections"],
-                teacher_temp,
-                update_centers=False,
-            ) if self.do_ibot and teacher_branch is not None else None
-
-            student_branch = model_outputs["student"]
-            student_global = student_branch["global"]
-            student_global_cls = student_branch["global_cls_projections"]
-            student_patch = student_branch["global_masked_patch_projections"]
-            global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
-
-            total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
-            if self.do_dino:
-                dino_global_loss = (
-                    self.dino_loss([global_cls_0], [teacher_cls_1]) +
-                    self.dino_loss([global_cls_1], [teacher_cls_0])
-                ) / total_terms
-
-                if n_local_views:
-                    student_local = student_branch["local"]
-                    local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
-                    dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
-                else:
-                    dino_local_loss = global_crops.new_zeros(())
-            else:
-                dino_global_loss = global_crops.new_zeros(())
-                dino_local_loss = global_crops.new_zeros(())
-
-            if self.do_ibot and n_masked > 0:
-                ibot_loss = self.ibot_patch_loss.forward_masked(
-                    student_patch,
-                    teacher_patch_targets,
-                    student_masks_flat=masks,
-                    n_masked_patches=n_masked,
-                    masks_weight=masks_weight,
-                )
-            else:
-                ibot_loss = global_crops.new_zeros(())
-
-            if self.do_koleo:
-                koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(n_global_views))
-            else:
-                koleo_loss = global_crops.new_zeros(())
-            gram_loss, _, _ = self._compute_gram_loss(
-                student_patch_tokens=student_global["patch_tokens"],
-                global_crops=global_crops,
-                gram_teacher_crops=gram_teacher_crops,
-            )
-
-            loss = (
-                self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
-                self.ibot_loss_weight * ibot_loss +
-                self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss
-            )
-
-        return {
-            "loss": float(loss.detach()),
-            "dino_global_loss": float(dino_global_loss.detach()),
-            "dino_local_loss": float(dino_local_loss.detach()),
-            "ibot_loss": float(ibot_loss.detach()),
-            "koleo_loss": float(koleo_loss.detach()),
-            "gram_loss": float(gram_loss.detach()),
-            "gram_loss_weight": float(self.gram_loss_weight),
-            "teacher_temp": teacher_temp,
-        }
-
     def _run_task_evals(self, step: int) -> None:
         if self._task_evaluator is None:
             return
@@ -1835,10 +2042,6 @@ class DinoIBOTPretrainer:
         dataloader = self.build_dataloader()
         self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
         dataloader_iter: Iterator[Any] = iter(dataloader)
-        val_dataloader = self.build_val_dataloader()
-        if val_dataloader is not None:
-            self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
-        val_dataloader_iter: Iterator[Any] | None = iter(val_dataloader) if val_dataloader is not None else None
         self._initialize_wandb()
         progress = tqdm(total=self.max_iterations, initial=start_step, desc="training", unit="iter") if self.is_main_process else None
         try:
@@ -1860,6 +2063,7 @@ class DinoIBOTPretrainer:
                         ibot_loss=f"{metrics['ibot_loss']:.4f}",
                         koleo_loss=f"{metrics['koleo_loss']:.4f}",
                         gram_loss=f"{metrics['gram_loss']:.4f}",
+                        component_loss=f"{metrics['component_loss']:.4f}",
                     )
                     progress.update(1)
                 if self.is_main_process:
@@ -1868,31 +2072,21 @@ class DinoIBOTPretrainer:
                 if self.is_main_process and step % self.log_every == 0:
                     print(
                         f"step={step} loss={metrics['loss']:.4f} lr={metrics['lr']:.2e} "
-                        f"gram={metrics['gram_loss']:.4f}"
+                        f"gram={metrics['gram_loss']:.4f} component={metrics['component_loss']:.4f}"
                     )
-                if self.val_every_n and step > 0 and step % self.val_every_n == 0:
-                    if val_dataloader_iter is None:
-                        if self.is_main_process and not self._warned_missing_val_dataset:
-                            print("val_every_n is set but no val_dataset is configured; skipping validation.")
-                            self._warned_missing_val_dataset = True
-                    else:
-                        try:
-                            val_batch = next(val_dataloader_iter)
-                        except StopIteration:
-                            self._val_sampler_epoch += 1
-                            self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
-                            val_dataloader_iter = iter(val_dataloader)
-                            val_batch = next(val_dataloader_iter)
-                        val_metrics = self._average_metrics(self.validate(val_batch, step))
-                        if self.is_main_process:
-                            print(f"step={step} val_loss={val_metrics['loss']:.4f}")
-                            image_path = self.save_monitor_image(val_batch, step, val_metrics)
-                            self._log_wandb_metrics(
-                                "val",
-                                val_metrics,
-                                step=step,
-                                extra={"val/monitor_image": self._wandb.Image(str(image_path))} if self._wandb_enabled() else None,
-                            )
+                if (
+                    self.is_main_process
+                    and self.monitor_every_n
+                    and step > 0
+                    and step % self.monitor_every_n == 0
+                ):
+                    image_path = self.save_monitor_image(batch, step, metrics)
+                    self._log_wandb_metrics(
+                        "monitor",
+                        {},
+                        step=step,
+                        extra={"monitor/image": self._wandb.Image(str(image_path))} if self._wandb_enabled() else None,
+                    )
                 if self.task_eval_every and step > 0 and step % self.task_eval_every == 0:
                     self._run_task_evals(step)
                 if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:
@@ -1901,7 +2095,6 @@ class DinoIBOTPretrainer:
             if progress is not None:
                 progress.close()
             self._close_dataloader(dataloader)
-            self._close_dataloader(val_dataloader)
             self._close_auxiliary_datasets()
 
 
