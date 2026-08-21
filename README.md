@@ -1,3 +1,6 @@
+# Update: 21/08/2026
+We moved the repository to the [villa](https://github.com/ScrollPrize/villa/tree/main/dinovol) monorepo.
+
 # Dinovol
 
 Dinovol is an implementation of DINO-style self-supervised pretraining on 3D
